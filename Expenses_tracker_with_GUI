@@ -1,0 +1,257 @@
+
+import json
+import os
+from datetime import datetime, timedelta
+import pandas as pd
+import tkinter as tk
+from tkinter import messagebox, simpledialog, filedialog
+
+
+categories = {"groceries": 0, "transportation": 0, "entertainment": 0, "utilities": 0}
+custom_categories = {}
+expenses = []
+
+def le():
+    global expenses, custom_categories
+    if os.path.exists('expenses.json'):
+        with open('expenses.json', 'r') as file:
+            data = json.load(file)
+            expenses = data.get('expenses', [])
+            custom_categories = data.get('custom_categories', {})
+        messagebox.showinfo("Load Data", "Expenses and categories loaded successfully.")
+    else:
+        messagebox.showinfo("Load Data", "No previous expense data found.")
+
+def se():
+    with open('expenses.json', 'w') as file:
+        data = {'expenses': expenses, 'custom_categories': custom_categories}
+        json.dump(data, file)
+    messagebox.showinfo("Save Data", "Expenses saved successfully.")
+
+def am():
+    category = cc()
+    if not category:
+        messagebox.showerror("Error", "Invalid category. Please choose again.")
+        return
+
+    try:
+        amount = float(simpledialog.askstring("Add Money", "Enter the amount spent:"))
+    except ValueError:
+        messagebox.showerror("Error", "Invalid format.")
+        return
+
+    description = simpledialog.askstring("Add Money", "Enter a brief description:")
+
+    date_input = simpledialog.askstring("Add Money", "Enter the date (YYYY-MM-DD):")
+    try:
+        date = datetime.strptime(date_input, "%Y-%m-%d").strftime("%Y-%m-%d")
+    except ValueError:
+        messagebox.showerror("Error", "Invalid date format. Please enter the date in YYYY-MM-DD format.")
+        return
+
+    expenses.append({'amount': amount, 'description': description, 'category': category, 'date': date})
+    messagebox.showinfo("Add Money", "Expense recorded successfully.")
+
+def ete():
+    df = pd.DataFrame(expenses)
+    
+    filename = filedialog.asksaveasfilename(defaultextension=".xlsx", filetypes=[("Excel files", "*.xlsx")])
+    if filename:
+        df.to_excel(filename, index=False, engine='openpyxl')
+        messagebox.showinfo("Export", f"Expenses exported to {filename}.")
+
+def cc():
+    all_categories = {**categories, **custom_categories}
+    category_list = list(all_categories.keys())
+    choice = simpledialog.askinteger("Select Category", "\n".join([f"{idx + 1}. {category.capitalize()}" for idx, category in enumerate(category_list)]))
+    
+    if choice and 1 <= choice <= len(category_list):
+        return category_list[choice - 1]
+    return None
+
+def vs():
+    total_expense = sum(expense['amount'] for expense in expenses)
+    summary = f"Total Expenses: ₹{total_expense:.2f}\n\n"
+
+    cs = {}
+    for expense in expenses:
+        category = expense['category']
+        if category in cs:
+            cs[category] =cs[category]+ expense['amount']
+        else:
+            cs[category] = expense['amount']
+
+    summary =summary+ "Expenses by Category:\n"
+    for category, amount in cs.items():
+        summary =summary+ f"{category.capitalize()}: ₹{amount:.2f}\n"
+
+    for category, total in cs.items():
+        count = sum(1 for expense in expenses if expense['category'] == category)
+        average = total / count if count > 0 else 0
+        summary =summary+ f"Average spending for {category.capitalize()}: ₹{average:.2f}\n"
+
+    highest_category = max(cs, key=cs.get)
+    lowest_category = min(cs, key=cs.get)
+    summary =summary+ f"\nCategory with highest expenses: {highest_category.capitalize()} (₹{cs[highest_category]:.2f})\n"
+    summary =summary+ f"Category with lowest expenses: {lowest_category.capitalize()} (₹{cs[lowest_category]:.2f})\n"
+
+    messagebox.showinfo("Summary", summary)
+
+def vep():
+    period = simpledialog.askstring("View Expenses", "Enter the period (daily/weekly/monthly):").strip().lower()
+
+    if period == 'daily':
+        date_input = simpledialog.askstring("View Expenses", "Enter the specific date (YYYY-MM-DD):")
+        try:
+            specific_date = datetime.strptime(date_input, "%Y-%m-%d").strftime("%Y-%m-%d")
+        except ValueError:
+            messagebox.showerror("Error", "Invalid date format. Please enter the date in YYYY-MM-DD format.")
+            return
+
+        fe = [expense for expense in expenses if expense['date'] == specific_date]
+        if not fe:
+            messagebox.showinfo("View Expenses", f"No expenses found for {specific_date}.")
+            return
+
+        display_expenses(fe)
+
+    elif period == 'weekly':
+        mi = simpledialog.askstring("View Expenses", "Enter the month (YYYY-MM):")
+        try:
+            som = datetime.strptime(mi, "%Y-%m").replace(day=1)
+            eom = (som + timedelta(days=31)).replace(day=1) - timedelta(days=1)
+        except ValueError:
+            messagebox.showerror("Error", "Invalid month format. Please enter the month in YYYY-MM format.")
+            return
+
+        cws = som
+        wn = 1
+
+        while cws <= eom:
+            we = cws + timedelta(days=6)
+            if we > eom:
+                we = eom
+
+            fe = [expense for expense in expenses if cws.strftime("%Y-%m-%d") <= expense['date'] <= we.strftime("%Y-%m-%d")]
+            if fe:
+                display_expenses(fe, title=f"Week {wn} ({cws.strftime('%Y-%m-%d')} to {we.strftime('%Y-%m-%d')})")
+            else:
+                messagebox.showinfo("View Expenses", f"No expenses found for Week {wn} ({cws.strftime('%Y-%m-%d')} to {we.strftime('%Y-%m-%d')}).")
+
+            cws = we + timedelta(days=1)
+            wn =wn+ 1
+
+    elif period == 'monthly':
+        mi = simpledialog.askstring("View Expenses", "Enter the month (YYYY-MM):")
+        try:
+            som = datetime.strptime(mi, "%Y-%m").replace(day=1)
+            eom = (som + timedelta(days=31)).replace(day=1) - timedelta(days=1)
+        except ValueError:
+            messagebox.showerror("Error", "Invalid month format. Please enter the month in YYYY-MM format.")
+            return
+
+        fe = [expense for expense in expenses if som.strftime("%Y-%m-%d") <= expense['date'] <= eom.strftime("%Y-%m-%d")]
+        if not fe:
+            messagebox.showinfo("View Expenses", f"No expenses found for {mi}.")
+            return
+
+        display_expenses(fe, title=f"Expenses for {mi}")
+
+    else:
+        messagebox.showerror("Error", "Invalid period entered. Please enter 'daily', 'weekly', or 'monthly'.")
+
+def display_expenses(expenses_list, title="Expenses"):
+    total_expense = sum(expense['amount'] for expense in expenses_list)
+    summary = f"Total: ₹{total_expense:.2f}\n\n"
+
+    cs = {}
+    for expense in expenses_list:
+        category = expense['category']
+        if category in cs:
+            cs[category] =cs[category]+ expense['amount']
+        else:
+            cs[category] = expense['amount']
+
+    summary =summary+ "Expenses by Category:\n"
+    for category, amount in cs.items():
+        summary =summary+ f"{category.capitalize()}: ₹{amount:.2f}\n"
+
+    messagebox.showinfo(title, summary)
+
+def manage_categories():
+    global custom_categories
+    while True:
+        choice = simpledialog.askinteger("Manage Categories", "1. Add Custom Category\n2. Edit Custom Category\n3. Remove Custom Category\n4. View All Categories\n5. Back to Main Menu")
+
+        if choice == 1:
+            category_name = simpledialog.askstring("Add Category", "Enter the name of the new category:").strip().lower()
+            if category_name in categories or category_name in custom_categories:
+                messagebox.showerror("Error", "Category already exists.")
+            else:
+                custom_categories[category_name] = 0
+                messagebox.showinfo("Add Category", f"Category '{category_name}' added.")
+
+        elif choice == 2:
+            if not custom_categories:
+                messagebox.showinfo("Edit Category", "No custom categories to edit.")
+                continue
+            category_list = list(custom_categories.keys())
+            index = simpledialog.askinteger("Edit Category", "\n".join([f"{idx + 1}. {category.capitalize()}" for idx, category in enumerate(category_list)])) - 1
+            try:
+                category_name = category_list[index]
+                new_name = simpledialog.askstring("Edit Category", f"Enter the new name for '{category_name}':").strip().lower()
+                if new_name in categories or new_name in custom_categories:
+                    messagebox.showerror("Error", "Category name already exists.")
+                else:
+                    custom_categories[new_name] = custom_categories.pop(category_name)
+                    messagebox.showinfo("Edit Category", f"Category '{category_name}' renamed to '{new_name}'.")
+            except (ValueError, IndexError):
+                messagebox.showerror("Error", "Invalid selection.")
+
+        elif choice == 3:
+            if not custom_categories:
+                messagebox.showinfo("Remove Category", "No custom categories to remove.")
+                continue
+            category_list = list(custom_categories.keys())
+            index = simpledialog.askinteger("Remove Category", "\n".join([f"{idx + 1}. {category.capitalize()}" for idx, category in enumerate(category_list)])) - 1
+            try:
+                category_name = category_list[index]
+                del custom_categories[category_name]
+                messagebox.showinfo("Remove Category", f"Category '{category_name}' removed.")
+            except (ValueError, IndexError):
+                messagebox.showerror("Error", "Invalid selection.")
+
+        elif choice == 4:
+            all_categories = {**categories, **custom_categories}
+            messagebox.showinfo("All Categories", "\n".join([f"{idx + 1}. {category.capitalize()}" for idx, category in enumerate(all_categories.keys())]))
+
+        elif choice == 5:
+            break
+
+        else:
+            messagebox.showerror("Error", "Invalid option. Please choose a correct option.")
+
+def main_menu():
+    while True:
+        choice = simpledialog.askinteger("Expense Tracker", "1. Add Money\n2. View Summary of Expenses\n3. View Expenses for Specific Period\n4. Manage Categories\n5. Save and Exit")
+
+        if choice == 1:
+            am()
+        elif choice == 2:
+            vs()
+        elif choice == 3:
+            vep()
+        elif choice == 4:
+            manage_categories()
+        elif choice == 5:
+            se()
+            ete()
+            break
+        else:
+            messagebox.showerror("Error", "Invalid option. Please choose a correct option.")
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    root.withdraw()
+    le()
+    main_menu()
