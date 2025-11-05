@@ -7,8 +7,6 @@ __pycache__/
 
 # Data files
 *.xlsx
-*.json
-expenses.json
 
 # IDE
 .vscode/
