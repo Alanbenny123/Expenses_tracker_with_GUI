@@ -3,6 +3,22 @@ import os
 from datetime import datetime, timedelta
 import pandas as pd
 import streamlit as st
+from io import BytesIO
+
+# Load environment variables from .env when available (for local dev)
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv()
+except Exception:
+    pass
+
+# Optional: SQLAlchemy for Postgres persistence when DATABASE_URL is set
+try:
+    from sqlalchemy import create_engine, text
+except Exception:  # library may not be installed in some environments
+    create_engine = None
+    text = None
 
 # Page config
 st.set_page_config(
@@ -19,6 +35,98 @@ if 'custom_categories' not in st.session_state:
     st.session_state.custom_categories = {}
 
 categories = {"groceries": 0, "transportation": 0, "entertainment": 0, "utilities": 0}
+
+
+# ---------------------------
+# Persistence helpers (DB/JSON)
+# ---------------------------
+def get_engine():
+    """Return a cached SQLAlchemy engine if DATABASE_URL is set and SQLAlchemy is available."""
+    db_url = os.environ.get("DATABASE_URL")
+    if not db_url or create_engine is None:
+        return None
+    if "db_engine" not in st.session_state:
+        st.session_state.db_engine = create_engine(db_url, pool_pre_ping=True)
+    return st.session_state.db_engine
+
+
+def init_db():
+    """Create tables if they do not exist (when using DB)."""
+    engine = get_engine()
+    if engine is None:
+        return
+    with engine.begin() as conn:
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS expenses (
+                id SERIAL PRIMARY KEY,
+                amount NUMERIC NOT NULL,
+                description TEXT,
+                category TEXT NOT NULL,
+                date DATE NOT NULL
+            );
+        """))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS custom_categories (
+                id SERIAL PRIMARY KEY,
+                name TEXT UNIQUE NOT NULL
+            );
+        """))
+
+
+def db_load_data():
+    """Load data from DB into session state."""
+    engine = get_engine()
+    if engine is None:
+        return False
+    init_db()
+    with engine.begin() as conn:
+        rows = conn.execute(text("SELECT amount, description, category, date FROM expenses ORDER BY date")).mappings().all()
+        st.session_state.expenses = [dict(r) for r in rows]
+        cat_rows = conn.execute(text("SELECT name FROM custom_categories ORDER BY name")).scalars().all()
+        st.session_state.custom_categories = {name: 0 for name in cat_rows}
+    return True
+
+
+def db_add_expense(expense):
+    engine = get_engine()
+    if engine is None:
+        return False
+    with engine.begin() as conn:
+        conn.execute(
+            text("INSERT INTO expenses(amount, description, category, date) VALUES(:a,:d,:c,:dt)"),
+            {"a": expense["amount"], "d": expense["description"], "c": expense["category"], "dt": expense["date"]},
+        )
+    return True
+
+
+def db_add_category(name):
+    engine = get_engine()
+    if engine is None:
+        return False
+    with engine.begin() as conn:
+        conn.execute(text("INSERT INTO custom_categories(name) VALUES(:n) ON CONFLICT (name) DO NOTHING"), {"n": name})
+    return True
+
+
+def db_rename_category(old_name, new_name):
+    engine = get_engine()
+    if engine is None:
+        return False
+    with engine.begin() as conn:
+        conn.execute(text("UPDATE custom_categories SET name=:new WHERE name=:old"), {"new": new_name, "old": old_name})
+        # Update existing expense rows to use the new category name
+        conn.execute(text("UPDATE expenses SET category=:new WHERE category=:old"), {"new": new_name, "old": old_name})
+    return True
+
+
+def db_remove_category(name):
+    engine = get_engine()
+    if engine is None:
+        return False
+    with engine.begin() as conn:
+        conn.execute(text("DELETE FROM custom_categories WHERE name=:n"), {"n": name})
+    return True
+
 
 def parse_date_input(date_input):
     """Parse flexible date input formats and convert to YYYY-MM-DD"""
@@ -83,7 +191,9 @@ def parse_date_input(date_input):
     return None
 
 def load_data():
-    """Load expenses from JSON file"""
+    """Load expenses from DB if configured, otherwise from JSON file"""
+    if db_load_data():
+        return
     if os.path.exists('expenses.json'):
         with open('expenses.json', 'r') as file:
             data = json.load(file)
@@ -124,7 +234,13 @@ def add_expense():
             new_category = st.text_input("Category Name", key="new_cat_name")
             if st.button("Add Category", key="add_cat_btn"):
                 if new_category and new_category.strip().lower() not in get_all_categories():
-                    st.session_state.custom_categories[new_category.strip().lower()] = 0
+                    name = new_category.strip().lower()
+                    if not db_add_category(name):
+                        st.session_state.custom_categories[name] = 0
+                        save_data()
+                    else:
+                        # refresh from DB
+                        db_load_data()
                     st.success(f"Category '{new_category}' added!")
                     st.rerun()
                 elif new_category.strip().lower() in get_all_categories():
@@ -161,8 +277,12 @@ def add_expense():
             'category': category,
             'date': parsed_date
         }
-        st.session_state.expenses.append(expense)
-        save_data()
+        # Persist
+        if not db_add_expense(expense):
+            st.session_state.expenses.append(expense)
+            save_data()
+        else:
+            db_load_data()
         st.success("✅ Expense added successfully!")
         st.rerun()
 
@@ -318,8 +438,11 @@ def manage_categories():
             if new_cat:
                 cat_name = new_cat.strip().lower()
                 if cat_name not in get_all_categories():
-                    st.session_state.custom_categories[cat_name] = 0
-                    save_data()
+                    if not db_add_category(cat_name):
+                        st.session_state.custom_categories[cat_name] = 0
+                        save_data()
+                    else:
+                        db_load_data()
                     st.success(f"Category '{cat_name}' added!")
                     st.rerun()
                 else:
@@ -336,8 +459,15 @@ def manage_categories():
                 if new_name:
                     new_name_lower = new_name.strip().lower()
                     if new_name_lower not in get_all_categories():
-                        st.session_state.custom_categories[new_name_lower] = st.session_state.custom_categories.pop(selected)
-                        save_data()
+                        # persist rename
+                        if not db_rename_category(selected, new_name_lower):
+                            st.session_state.custom_categories[new_name_lower] = st.session_state.custom_categories.pop(selected)
+                            for expense in st.session_state.expenses:
+                                if expense['category'] == selected:
+                                    expense['category'] = new_name_lower
+                            save_data()
+                        else:
+                            db_load_data()
                         st.success(f"Category renamed to '{new_name_lower}'!")
                         st.rerun()
                     else:
@@ -350,8 +480,11 @@ def manage_categories():
             cat_list = list(st.session_state.custom_categories.keys())
             selected = st.selectbox("Select category to remove", cat_list, key="remove_cat")
             if st.button("Remove", type="primary", key="remove_btn"):
-                del st.session_state.custom_categories[selected]
-                save_data()
+                if not db_remove_category(selected):
+                    del st.session_state.custom_categories[selected]
+                    save_data()
+                else:
+                    db_load_data()
                 st.success(f"Category '{selected}' removed!")
                 st.rerun()
     
@@ -366,15 +499,16 @@ def export_to_excel():
     if not st.session_state.expenses:
         st.warning("No expenses to export")
         return
-    
     df = pd.DataFrame(st.session_state.expenses)
-    excel_data = df.to_excel(index=False, engine='openpyxl')
-    
+    buffer = BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False)
+    buffer.seek(0)
     st.download_button(
         label="📥 Download Excel File",
-        data=excel_data if isinstance(excel_data, bytes) else None,
+        data=buffer,
         file_name=f"expenses_{datetime.now().strftime('%Y%m%d')}.xlsx",
-        mime="application/vnd.openpyxl.formats-officedocument.spreadsheetml.sheet"
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
 # Main app
@@ -416,4 +550,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
 
