@@ -51,22 +51,39 @@ pip install pandas openpyxl
 python Expenses_tracker_with_GUI
 ```
 
-### Web Version (Streamlit)
+### Web Version (Streamlit) – Local Development
 
 ```bash
 # Install Streamlit dependencies
 pip install -r requirements.txt
 
+# (Optional) create a .env file with your Postgres URL for persistent storage
+echo DATABASE_URL="postgresql://USER:PASSWORD@HOST/neondb?sslmode=require" > .env
+
 # Run the web app
 streamlit run app.py
 ```
 
-**Deploy to Streamlit Cloud:**
-1. Push your code to GitHub
-2. Go to [share.streamlit.io](https://share.streamlit.io)
-3. Connect your repository
-4. Set main file to `app.py`
-5. Deploy! 🎉
+### Configure persistent storage with Neon (optional but recommended)
+
+1. Sign up for the free tier at [neon.tech](https://console.neon.tech)
+2. Create a project → choose the closest region (e.g. *Asia Pacific – Singapore* for India)
+3. Click **Connect** → select **SQLAlchemy** → copy the connection string  
+   `postgresql://USER:PASSWORD@HOST/neondb?sslmode=require`
+4. For local dev, place this string in `.env` as shown above (the app loads it via `python-dotenv`)
+5. Without `DATABASE_URL`, the app falls back to local `expenses.json`
+
+### Deploy to Streamlit Community Cloud (free)
+
+1. Push the repo to GitHub
+2. Visit [share.streamlit.io](https://share.streamlit.io) and sign in with GitHub
+3. Click **New app** → select this repository (`main` branch, `app.py`)
+4. Before deploying, open **Advanced settings → Secrets** and add:
+   ```
+   DATABASE_URL="postgresql://USER:PASSWORD@HOST/neondb?sslmode=require"
+   ```
+5. Deploy. Streamlit rebuilds automatically whenever you push new commits.
+6. Your live app (e.g. `https://trackmyrupees.streamlit.app`) now persists data in Neon Postgres 🎉
 
 ## 📋 Requirements
 
