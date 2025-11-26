@@ -128,6 +128,49 @@ def db_remove_category(name):
     return True
 
 
+def db_update_expense(index, expense):
+    """Update expense by index (requires loading expenses first to get the correct ID)"""
+    engine = get_engine()
+    if engine is None:
+        return False
+    
+    # Get all expenses to find the correct database ID for this index
+    with engine.begin() as conn:
+        rows = conn.execute(text("SELECT id FROM expenses ORDER BY date")).fetchall()
+        if index >= len(rows):
+            return False
+        
+        expense_id = rows[index][0]
+        conn.execute(
+            text("UPDATE expenses SET amount=:a, description=:d, category=:c, date=:dt WHERE id=:id"),
+            {
+                "a": expense["amount"],
+                "d": expense["description"], 
+                "c": expense["category"],
+                "dt": expense["date"],
+                "id": expense_id
+            }
+        )
+    return True
+
+
+def db_delete_expense(index):
+    """Delete expense by index (requires loading expenses first to get the correct ID)"""
+    engine = get_engine()
+    if engine is None:
+        return False
+    
+    # Get all expenses to find the correct database ID for this index
+    with engine.begin() as conn:
+        rows = conn.execute(text("SELECT id FROM expenses ORDER BY date")).fetchall()
+        if index >= len(rows):
+            return False
+        
+        expense_id = rows[index][0]
+        conn.execute(text("DELETE FROM expenses WHERE id=:id"), {"id": expense_id})
+    return True
+
+
 def parse_date_input(date_input):
     """Parse flexible date input formats and convert to YYYY-MM-DD"""
     if not date_input:
@@ -494,6 +537,126 @@ def manage_categories():
         for idx, cat in enumerate(all_cats.keys(), 1):
             st.write(f"{idx}. {cat.capitalize()}")
 
+def edit_expenses():
+    """Edit existing expenses"""
+    st.subheader("✏️ Edit Expenses")
+    
+    if not st.session_state.expenses:
+        st.info("No expenses to edit.")
+        return
+    
+    # Create a DataFrame for display
+    df = pd.DataFrame(st.session_state.expenses)
+    df['index'] = df.index
+    df['Amount'] = df['amount'].apply(lambda x: f"₹{x:.2f}")
+    df['Category'] = df['category'].str.capitalize()
+    df['Date'] = df['date']
+    df['Description'] = df['description']
+    
+    display_df = df[['index', 'Date', 'Category', 'Description', 'Amount']].copy()
+    display_df.columns = ['#', 'Date', 'Category', 'Description', 'Amount']
+    
+    st.write("**Select an expense to edit:**")
+    st.dataframe(display_df, use_container_width=True, hide_index=True)
+    
+    # Select expense to edit
+    expense_index = st.number_input(
+        "Enter expense number (#) to edit:",
+        min_value=0,
+        max_value=len(st.session_state.expenses) - 1,
+        step=1,
+        key="edit_expense_index"
+    )
+    
+    if expense_index < len(st.session_state.expenses):
+        expense = st.session_state.expenses[expense_index]
+        
+        st.divider()
+        st.write(f"**Editing Expense #{expense_index}**")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            # Category selection
+            all_categories = get_all_categories()
+            category_list = list(all_categories.keys())
+            current_category_idx = category_list.index(expense['category']) if expense['category'] in category_list else 0
+            
+            new_category = st.selectbox(
+                "Category",
+                category_list,
+                index=current_category_idx,
+                key="edit_category"
+            )
+        
+        with col2:
+            new_amount = st.number_input(
+                "Amount (₹)",
+                min_value=0.0,
+                step=0.01,
+                value=float(expense['amount']),
+                key="edit_amount"
+            )
+        
+        new_description = st.text_input(
+            "Description",
+            value=expense['description'],
+            key="edit_description"
+        )
+        
+        new_date_input = st.text_input(
+            "Date (YYYY-MM-DD or DD or YY-MM-DD or MM-DD)",
+            value=expense['date'],
+            key="edit_date"
+        )
+        
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            if st.button("💾 Save Changes", type="primary", use_container_width=True):
+                # Parse the new date
+                parsed_date = parse_date_input(new_date_input)
+                if parsed_date is None:
+                    try:
+                        parsed_date = datetime.strptime(new_date_input, "%Y-%m-%d").strftime("%Y-%m-%d")
+                    except ValueError:
+                        st.error("Invalid date format")
+                        return
+                
+                # Update the expense
+                updated_expense = {
+                    'amount': new_amount,
+                    'description': new_description,
+                    'category': new_category,
+                    'date': parsed_date
+                }
+                
+                # Update in database or session state
+                if not db_update_expense(expense_index, updated_expense):
+                    st.session_state.expenses[expense_index] = updated_expense
+                    save_data()
+                else:
+                    db_load_data()
+                
+                st.success("✅ Expense updated successfully!")
+                st.rerun()
+        
+        with col2:
+            if st.button("🗑️ Delete Expense", use_container_width=True):
+                # Delete from database or session state
+                if not db_delete_expense(expense_index):
+                    st.session_state.expenses.pop(expense_index)
+                    save_data()
+                else:
+                    db_load_data()
+                
+                st.success("🗑️ Expense deleted successfully!")
+                st.rerun()
+        
+        with col3:
+            if st.button("❌ Cancel", use_container_width=True):
+                st.rerun()
+
 def export_to_excel():
     """Export expenses to Excel"""
     if not st.session_state.expenses:
@@ -523,7 +686,7 @@ def main():
     # Navigation
     page = st.radio(
         "Navigation",
-        ["➕ Add Expense", "📊 View Summary", "📅 View by Period", "📁 Manage Categories"],
+        ["➕ Add Expense", "📊 View Summary", "📅 View by Period", "✏️ Edit Expenses", "📁 Manage Categories"],
         horizontal=True,
         label_visibility="collapsed"
     )
@@ -537,6 +700,8 @@ def main():
         view_summary()
     elif page == "📅 View by Period":
         view_expenses_period()
+    elif page == "✏️ Edit Expenses":
+        edit_expenses()
     elif page == "📁 Manage Categories":
         manage_categories()
     
