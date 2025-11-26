@@ -287,7 +287,7 @@ def add_expense():
     description = st.text_input("Description", key="add_desc")
     
     date_input = st.text_input(
-        "📅 Date (DD/MM-DD/YY-MM-DD/YYYY-MM-DD)",
+        "📅 Date (YYYY-MM-DD)",
         placeholder="e.g., 15 or 01-15 or 24-01-15 or 2024-01-15",
         key="add_date"
     )
@@ -317,19 +317,16 @@ def add_expense():
             'date': parsed_date
         }
         
-        # Check for duplicates (same date, category, amount, and description)
-        # Handle empty descriptions properly
-        desc_normalized = description.lower().strip() if description else ""
+        # Check for duplicates (same date, category, and amount - ignore description)
         duplicates = [
             e for e in st.session_state.expenses 
             if (e['date'] == parsed_date and 
                 e['category'] == category and 
-                e['amount'] == amount and 
-                (e['description'].lower().strip() if e['description'] else "") == desc_normalized)
+                e['amount'] == amount)
         ]
         
         if duplicates:
-            st.warning(f"⚠️ Found {len(duplicates)} identical expense(s) with the same date, category, amount, and description:")
+            st.warning(f"⚠️ Found {len(duplicates)} identical expense(s) with the same date, category, and amount:")
             for i, dup in enumerate(duplicates[:3], 1):  # Show max 3 duplicates
                 st.write(f"{i}. {dup['description']} - ₹{dup['amount']:.2f} on {dup['date']} ({dup['category'].capitalize()})")
             if len(duplicates) > 3:
@@ -492,7 +489,7 @@ def display_expenses(expenses_list, title="Expenses"):
     df['Amount'] = df['amount'].apply(lambda x: f"₹{x:.2f}")
     df['Category'] = df['category'].str.capitalize()
     df = df[['date', 'Category', 'description', 'Amount']]
-    df.columns = ['Date (DD/MM-DD/YY-MM-DD/YYYY-MM-DD)', 'Category', 'Description', 'Amount']
+    df.columns = ['Date (YYYY-MM-DD)', 'Category', 'Description', 'Amount']
     st.dataframe(df, use_container_width=True, hide_index=True)
 
 def manage_categories():
@@ -578,7 +575,7 @@ def edit_expenses():
     df['Description'] = df['description']
     
     display_df = df[['index', 'Date', 'Category', 'Description', 'Amount']].copy()
-    display_df.columns = ['#', 'Date (DD/MM-DD/YY-MM-DD/YYYY-MM-DD)', 'Category', 'Description', 'Amount']
+    display_df.columns = ['#', 'Date (YYYY-MM-DD)', 'Category', 'Description', 'Amount']
     
     st.write("**Select an expense to edit:**")
     st.dataframe(display_df, use_container_width=True, hide_index=True)
@@ -685,13 +682,11 @@ def remove_duplicates():
     duplicate_groups = {}
     
     for i, expense in enumerate(st.session_state.expenses):
-        # Create a key for comparison (normalize description)
-        desc_normalized = expense['description'].lower().strip() if expense['description'] else ""
+        # Create a key for comparison (date, category, amount only - ignore description)
         key = (
             expense['date'],
             expense['category'],
-            expense['amount'],
-            desc_normalized
+            expense['amount']
         )
         
         if key not in duplicate_groups:
@@ -711,10 +706,8 @@ def remove_duplicates():
         
         # Show each duplicate group
         for group_idx, (key, group) in enumerate(actual_duplicates.items()):
-            date, category, amount, description = key
+            date, category, amount = key
             st.write(f"**Group {group_idx + 1}:** {category.capitalize()} - ₹{amount:.2f} on {date}")
-            if description:
-                st.write(f"Description: {description}")
             
             # Show all items in this group with checkboxes
             for item_idx, (original_idx, expense) in enumerate(group):
