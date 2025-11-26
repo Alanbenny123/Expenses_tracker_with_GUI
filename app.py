@@ -7,6 +7,9 @@ from io import BytesIO
 import hashlib
 import secrets
 import re
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 
 # Load environment variables from .env when available (for local dev)
 try:
@@ -427,37 +430,91 @@ def save_user_category(user_id, category_name):
         """), {"user_id": user_id, "name": category_name})
     return True
 
+def send_recovery_email(email, pin):
+    """Send PIN recovery email"""
+    try:
+        gmail_user = os.getenv('GMAIL_USER')
+        gmail_password = os.getenv('GMAIL_APP_PASSWORD')
+        
+        if not gmail_user or not gmail_password:
+            return False, "Email not configured"
+        
+        # Create message
+        msg = MIMEMultipart()
+        msg['From'] = gmail_user
+        msg['To'] = email
+        msg['Subject'] = "💰 Expense Tracker - PIN Recovery"
+        
+        body = f"""
+        Hello!
+        
+        You requested to recover your PIN for the Expense Tracker app.
+        
+        Your PIN is: {pin}
+        
+        Please keep this PIN safe and secure.
+        
+        If you didn't request this, please ignore this email.
+        
+        Best regards,
+        Expense Tracker Team
+        """
+        
+        msg.attach(MIMEText(body, 'plain'))
+        
+        # Send email
+        server = smtplib.SMTP('smtp.gmail.com', 587)
+        server.starttls()
+        server.login(gmail_user, gmail_password)
+        text = msg.as_string()
+        server.sendmail(gmail_user, email, text)
+        server.quit()
+        
+        return True, "Email sent successfully"
+    
+    except Exception as e:
+        return False, f"Failed to send email: {str(e)}"
+
 def recover_pin_by_email(email):
     """Recover PIN using recovery email"""
     engine = get_engine()
     if engine is None:
         # Fallback for local testing without database
         if 'local_users' not in st.session_state:
-            return None
+            return None, "No users found"
         
         for user_id, user_data in st.session_state.local_users.items():
             if user_data.get('recovery_email') == email:
-                # For demo purposes, we'll reverse-engineer the PIN from hash
-                # In production, you'd send an email with a reset link
-                return "1234"  # Demo PIN for local testing
-        return None
+                # For local testing, return the demo PIN
+                return "1234", "local_demo"
+        return None, "Email not found"
     
     try:
         with engine.begin() as conn:
             result = conn.execute(text("""
-                SELECT pin_hash FROM users 
+                SELECT id, pin_hash FROM users 
                 WHERE recovery_email = :email AND user_type = 'pin'
             """), {"email": email})
             
             row = result.fetchone()
             if row:
-                # In production, you'd send an email with a reset link
-                # For demo, we'll show a message
-                return "****"  # Don't show actual PIN in production
-            return None
+                user_id, pin_hash = row
+                # In production, we need to generate a temporary PIN or reset token
+                # For now, we'll create a temporary 6-digit PIN
+                temp_pin = secrets.randbelow(900000) + 100000  # 6-digit number
+                temp_pin_str = str(temp_pin)
+                
+                # Update user with temporary PIN hash
+                new_pin_hash = hash_pin(temp_pin_str)
+                conn.execute(text("""
+                    UPDATE users SET pin_hash = :new_hash 
+                    WHERE id = :user_id
+                """), {"new_hash": new_pin_hash, "user_id": user_id})
+                
+                return temp_pin_str, "database"
+            return None, "Email not found"
     except Exception as e:
-        st.error(f"Database error: {e}")
-        return None
+        return None, f"Database error: {str(e)}"
 
 def get_all_categories():
     """Get all categories including custom ones"""
@@ -1115,12 +1172,24 @@ def show_pin_login():
                         st.error("Invalid email format")
                     else:
                         # Check if email exists and get PIN
-                        recovered_pin = recover_pin_by_email(recovery_email_input)
+                        recovered_pin, source = recover_pin_by_email(recovery_email_input)
                         if recovered_pin:
-                            st.success(f"✅ Your PIN is: **{recovered_pin}**")
-                            st.info("💡 Save this PIN somewhere safe!")
+                            if source == "local_demo":
+                                st.success(f"✅ Your PIN is: **{recovered_pin}**")
+                                st.info("💡 (Local demo mode - save this PIN!)")
+                            elif source == "database":
+                                # Try to send email
+                                email_sent, message = send_recovery_email(recovery_email_input, recovered_pin)
+                                if email_sent:
+                                    st.success("✅ New PIN sent to your email!")
+                                    st.info("📧 Check your inbox for the new PIN")
+                                else:
+                                    # Fallback: show PIN if email fails
+                                    st.warning(f"⚠️ Email failed: {message}")
+                                    st.success(f"✅ Your new PIN is: **{recovered_pin}**")
+                                    st.info("💡 Save this PIN somewhere safe!")
                         else:
-                            st.error("❌ No account found with this email")
+                            st.error(f"❌ {source}")
             
             with col2:
                 if st.button("❌ Cancel", use_container_width=True):
@@ -1228,6 +1297,10 @@ def main():
     elif st.session_state.auth_mode == "account_login":
         show_account_login()
         return
+    
+    # Initialize database on first run
+    if get_engine() is not None:
+        init_db()
     
     # For authenticated users or guests, load data
     if st.session_state.auth_mode == "guest":
