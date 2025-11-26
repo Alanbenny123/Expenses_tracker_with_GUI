@@ -320,14 +320,47 @@ def add_expense():
             'category': category,
             'date': parsed_date
         }
-        # Persist
-        if not db_add_expense(expense):
-            st.session_state.expenses.append(expense)
-            save_data()
+        
+        # Check for duplicates (same date, category, amount, and description)
+        duplicates = [
+            e for e in st.session_state.expenses 
+            if (e['date'] == parsed_date and 
+                e['category'] == category and 
+                e['amount'] == amount and 
+                e['description'].lower().strip() == description.lower().strip())
+        ]
+        
+        if duplicates:
+            st.warning(f"⚠️ Found {len(duplicates)} identical expense(s) with the same date, category, amount, and description:")
+            for i, dup in enumerate(duplicates[:3], 1):  # Show max 3 duplicates
+                st.write(f"{i}. {dup['description']} - ₹{dup['amount']:.2f} on {dup['date']} ({dup['category'].capitalize()})")
+            if len(duplicates) > 3:
+                st.write(f"... and {len(duplicates) - 3} more")
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button("✅ Add Anyway", type="primary", use_container_width=True, key="confirm_add"):
+                    # Persist
+                    if not db_add_expense(expense):
+                        st.session_state.expenses.append(expense)
+                        save_data()
+                    else:
+                        db_load_data()
+                    st.success("✅ Expense added successfully!")
+                    st.rerun()
+            with col2:
+                if st.button("❌ Cancel", use_container_width=True, key="cancel_add"):
+                    st.info("Expense not added.")
+                    st.rerun()
         else:
-            db_load_data()
-        st.success("✅ Expense added successfully!")
-        st.rerun()
+            # No duplicates, add directly
+            if not db_add_expense(expense):
+                st.session_state.expenses.append(expense)
+                save_data()
+            else:
+                db_load_data()
+            st.success("✅ Expense added successfully!")
+            st.rerun()
 
 def view_summary():
     """View expense summary"""
