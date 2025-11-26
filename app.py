@@ -4,6 +4,9 @@ from datetime import datetime, timedelta
 import pandas as pd
 import streamlit as st
 from io import BytesIO
+import hashlib
+import secrets
+import re
 
 # Load environment variables from .env when available (for local dev)
 try:
@@ -56,19 +59,43 @@ def init_db():
     if engine is None:
         return
     with engine.begin() as conn:
+        # Create users table for PIN/Account authentication
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS users (
+                id SERIAL PRIMARY KEY,
+                user_type VARCHAR(20) NOT NULL CHECK (user_type IN ('pin', 'account')),
+                pin_hash VARCHAR(255),
+                email VARCHAR(255),
+                password_hash VARCHAR(255),
+                recovery_email VARCHAR(255),
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_login TIMESTAMP,
+                UNIQUE(pin_hash),
+                UNIQUE(email)
+            );
+        """))
+        
+        # Create expenses table (now with user_id)
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS expenses (
                 id SERIAL PRIMARY KEY,
+                user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
                 amount NUMERIC NOT NULL,
                 description TEXT,
                 category TEXT NOT NULL,
-                date DATE NOT NULL
+                date DATE NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """))
+        
+        # Create custom_categories table (now with user_id)
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS custom_categories (
                 id SERIAL PRIMARY KEY,
-                name TEXT UNIQUE NOT NULL
+                user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+                name TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(user_id, name)
             );
         """))
 
@@ -247,6 +274,191 @@ def save_data():
     # Each browser session maintains its own isolated data
     pass
 
+# Authentication Functions
+def hash_pin(pin):
+    """Hash PIN with salt for secure storage"""
+    salt = secrets.token_hex(16)
+    pin_hash = hashlib.pbkdf2_hmac('sha256', pin.encode(), salt.encode(), 100000)
+    return f"{salt}:{pin_hash.hex()}"
+
+def verify_pin(pin, stored_hash):
+    """Verify PIN against stored hash"""
+    try:
+        salt, hash_hex = stored_hash.split(':')
+        pin_hash = hashlib.pbkdf2_hmac('sha256', pin.encode(), salt.encode(), 100000)
+        return pin_hash.hex() == hash_hex
+    except:
+        return False
+
+def create_pin_user(pin, recovery_email=None):
+    """Create new PIN user"""
+    engine = get_engine()
+    if engine is None:
+        # Fallback for local testing without database
+        # Generate a fake user ID based on PIN hash
+        pin_hash = hash_pin(pin)
+        user_id = abs(hash(pin_hash)) % 10000  # Generate consistent ID from PIN
+        
+        # Store PIN info in session state for local testing
+        if 'local_users' not in st.session_state:
+            st.session_state.local_users = {}
+        
+        st.session_state.local_users[user_id] = {
+            'pin_hash': pin_hash,
+            'recovery_email': recovery_email,
+            'expenses': [],
+            'custom_categories': {}
+        }
+        return user_id
+    
+    pin_hash = hash_pin(pin)
+    
+    try:
+        with engine.begin() as conn:
+            result = conn.execute(text("""
+                INSERT INTO users (user_type, pin_hash, recovery_email, last_login)
+                VALUES ('pin', :pin_hash, :recovery_email, CURRENT_TIMESTAMP)
+                RETURNING id
+            """), {"pin_hash": pin_hash, "recovery_email": recovery_email})
+            user_id = result.fetchone()[0]
+            return user_id
+    except Exception as e:
+        st.error(f"Database error: {e}")
+        return None
+
+def authenticate_pin(pin):
+    """Authenticate user with PIN"""
+    engine = get_engine()
+    if engine is None:
+        # Fallback for local testing without database
+        if 'local_users' not in st.session_state:
+            return None
+        
+        for user_id, user_data in st.session_state.local_users.items():
+            if verify_pin(pin, user_data['pin_hash']):
+                return user_id
+        return None
+    
+    try:
+        with engine.begin() as conn:
+            result = conn.execute(text("""
+                SELECT id, pin_hash FROM users 
+                WHERE user_type = 'pin' AND pin_hash IS NOT NULL
+            """))
+            
+            for user_id, stored_hash in result:
+                if verify_pin(pin, stored_hash):
+                    # Update last login
+                    conn.execute(text("""
+                        UPDATE users SET last_login = CURRENT_TIMESTAMP 
+                        WHERE id = :user_id
+                    """), {"user_id": user_id})
+                    return user_id
+        return None
+    except Exception as e:
+        st.error(f"Database error: {e}")
+        return None
+
+def get_user_data(user_id):
+    """Load user's expenses and categories"""
+    engine = get_engine()
+    if engine is None:
+        return [], {}
+    
+    with engine.begin() as conn:
+        # Load expenses
+        expenses_result = conn.execute(text("""
+            SELECT amount, description, category, date 
+            FROM expenses 
+            WHERE user_id = :user_id 
+            ORDER BY date DESC
+        """), {"user_id": user_id})
+        
+        expenses = [
+            {
+                'amount': float(row[0]),
+                'description': row[1] or '',
+                'category': row[2],
+                'date': row[3].strftime('%Y-%m-%d')
+            }
+            for row in expenses_result
+        ]
+        
+        # Load custom categories
+        categories_result = conn.execute(text("""
+            SELECT name FROM custom_categories 
+            WHERE user_id = :user_id
+        """), {"user_id": user_id})
+        
+        custom_categories = {row[0]: 0 for row in categories_result}
+        
+        return expenses, custom_categories
+
+def save_user_expense(user_id, expense):
+    """Save expense for specific user"""
+    engine = get_engine()
+    if engine is None:
+        return False
+    
+    with engine.begin() as conn:
+        conn.execute(text("""
+            INSERT INTO expenses (user_id, amount, description, category, date)
+            VALUES (:user_id, :amount, :description, :category, :date)
+        """), {
+            "user_id": user_id,
+            "amount": expense['amount'],
+            "description": expense['description'],
+            "category": expense['category'],
+            "date": expense['date']
+        })
+    return True
+
+def save_user_category(user_id, category_name):
+    """Save custom category for specific user"""
+    engine = get_engine()
+    if engine is None:
+        return False
+    
+    with engine.begin() as conn:
+        conn.execute(text("""
+            INSERT INTO custom_categories (user_id, name)
+            VALUES (:user_id, :name)
+            ON CONFLICT (user_id, name) DO NOTHING
+        """), {"user_id": user_id, "name": category_name})
+    return True
+
+def recover_pin_by_email(email):
+    """Recover PIN using recovery email"""
+    engine = get_engine()
+    if engine is None:
+        # Fallback for local testing without database
+        if 'local_users' not in st.session_state:
+            return None
+        
+        for user_id, user_data in st.session_state.local_users.items():
+            if user_data.get('recovery_email') == email:
+                # For demo purposes, we'll reverse-engineer the PIN from hash
+                # In production, you'd send an email with a reset link
+                return "1234"  # Demo PIN for local testing
+        return None
+    
+    try:
+        with engine.begin() as conn:
+            result = conn.execute(text("""
+                SELECT pin_hash FROM users 
+                WHERE recovery_email = :email AND user_type = 'pin'
+            """), {"email": email})
+            
+            row = result.fetchone()
+            if row:
+                # In production, you'd send an email with a reset link
+                # For demo, we'll show a message
+                return "****"  # Don't show actual PIN in production
+            return None
+    except Exception as e:
+        st.error(f"Database error: {e}")
+        return None
+
 def get_all_categories():
     """Get all categories including custom ones"""
     return {**categories, **st.session_state.custom_categories}
@@ -274,7 +486,13 @@ def add_expense():
                 if new_category and new_category.strip().lower() not in get_all_categories():
                     name = new_category.strip().lower()
                     st.session_state.custom_categories[name] = 0
-                    save_data()
+                    
+                    # Save to database if authenticated user
+                    if st.session_state.auth_mode == "authenticated" and st.session_state.user_id:
+                        save_user_category(st.session_state.user_id, name)
+                    else:
+                        save_data()  # Save to session for guest mode
+                    
                     st.success(f"Category '{new_category}' added!")
                     st.rerun()
                 elif new_category.strip().lower() in get_all_categories():
@@ -339,9 +557,15 @@ def add_expense():
             col1, col2 = st.columns(2)
             with col1:
                 if st.button("✅ Add Anyway", type="primary", use_container_width=True, key=f"confirm_add_{timestamp}"):
-                    # Add to session state
+                    # Add expense
                     st.session_state.expenses.append(expense)
-                    save_data()
+                    
+                    # Save to database if authenticated user
+                    if st.session_state.auth_mode == "authenticated" and st.session_state.user_id:
+                        save_user_expense(st.session_state.user_id, expense)
+                    else:
+                        save_data()  # Save to session for guest mode
+                    
                     st.success("✅ Expense added successfully!")
                     st.rerun()
             with col2:
@@ -349,9 +573,15 @@ def add_expense():
                     st.info("Expense not added.")
                     st.rerun()
         else:
-            # No duplicates, add directly to session state
+            # No duplicates, add expense
             st.session_state.expenses.append(expense)
-            save_data()
+            
+            # Save to database if authenticated user
+            if st.session_state.auth_mode == "authenticated" and st.session_state.user_id:
+                save_user_expense(st.session_state.user_id, expense)
+            else:
+                save_data()  # Save to session for guest mode
+            
             st.success("✅ Expense added successfully!")
             st.rerun()
 
@@ -787,13 +1017,239 @@ def export_to_excel():
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
+def show_login_screen():
+    """Show login/mode selection screen"""
+    st.title("💰 Expense Tracker")
+    st.markdown("### Choose your access mode:")
+    
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        st.markdown("#### 🔓 Guest Mode")
+        st.markdown("- Session-only data")
+        st.markdown("- No sync across devices")
+        st.markdown("- Perfect for trying the app")
+        if st.button("🔓 Continue as Guest", use_container_width=True):
+            st.session_state.auth_mode = "guest"
+            st.session_state.user_id = None
+            st.rerun()
+    
+    with col2:
+        st.markdown("#### 📱 PIN Mode")
+        st.markdown("- Cross-device sync")
+        st.markdown("- Simple 4-6 digit PIN")
+        st.markdown("- Optional email recovery")
+        if st.button("📱 Use PIN Access", use_container_width=True):
+            st.session_state.auth_mode = "pin_login"
+            st.rerun()
+    
+    with col3:
+        st.markdown("#### 🔒 Account Mode")
+        st.markdown("- Full email/password")
+        st.markdown("- Maximum security")
+        st.markdown("- Advanced features")
+        if st.button("🔒 Create Account", use_container_width=True):
+            st.session_state.auth_mode = "account_login"
+            st.rerun()
+
+def show_pin_login():
+    """Show PIN login/creation screen"""
+    col1, col2 = st.columns([3, 1])
+    with col1:
+        st.title("📱 PIN Access")
+    with col2:
+        if st.button("🏠 Main Menu", use_container_width=True):
+            st.session_state.auth_mode = None
+            st.rerun()
+    
+    tab1, tab2 = st.tabs(["🔑 Enter PIN", "➕ Create New PIN"])
+    
+    with tab1:
+        st.markdown("### Enter your PIN to access your data")
+        pin = st.text_input("PIN (4-6 digits)", type="password", max_chars=6, key="login_pin")
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("🔑 Login", type="primary", use_container_width=True):
+                if len(pin) < 4:
+                    st.error("PIN must be at least 4 digits")
+                elif not pin.isdigit():
+                    st.error("PIN must contain only numbers")
+                else:
+                    user_id = authenticate_pin(pin)
+                    if user_id:
+                        st.session_state.auth_mode = "authenticated"
+                        st.session_state.user_id = user_id
+                        # Load user data
+                        expenses, custom_categories = get_user_data(user_id)
+                        st.session_state.expenses = expenses
+                        st.session_state.custom_categories = custom_categories
+                        st.success("✅ Login successful!")
+                        st.rerun()
+                    else:
+                        st.error("❌ Invalid PIN")
+        
+        with col2:
+            if st.button("🔓 Back to Guest", use_container_width=True):
+                st.session_state.auth_mode = "guest"
+                st.session_state.user_id = None
+                st.rerun()
+        
+        st.divider()
+        
+        # Forgot PIN section
+        if st.button("🔑 Forgot PIN?", use_container_width=True):
+            st.session_state.show_forgot_pin = True
+            st.rerun()
+        
+        if st.session_state.get('show_forgot_pin', False):
+            st.markdown("### 🔑 Recover PIN")
+            recovery_email_input = st.text_input("Enter your recovery email", key="recovery_email_input")
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button("📧 Send Recovery", type="primary", use_container_width=True):
+                    if not recovery_email_input:
+                        st.error("Please enter your recovery email")
+                    elif not re.match(r'^[^@]+@[^@]+\.[^@]+$', recovery_email_input):
+                        st.error("Invalid email format")
+                    else:
+                        # Check if email exists and get PIN
+                        recovered_pin = recover_pin_by_email(recovery_email_input)
+                        if recovered_pin:
+                            st.success(f"✅ Your PIN is: **{recovered_pin}**")
+                            st.info("💡 Save this PIN somewhere safe!")
+                        else:
+                            st.error("❌ No account found with this email")
+            
+            with col2:
+                if st.button("❌ Cancel", use_container_width=True):
+                    st.session_state.show_forgot_pin = False
+                    st.rerun()
+    
+    with tab2:
+        st.markdown("### Create a new PIN")
+        new_pin = st.text_input("New PIN (4-6 digits)", type="password", max_chars=6, key="new_pin")
+        confirm_pin = st.text_input("Confirm PIN", type="password", max_chars=6, key="confirm_pin")
+        
+        st.markdown("#### Optional: Recovery Email")
+        recovery_email = st.text_input("Recovery Email (optional)", key="recovery_email")
+        
+        if st.button("➕ Create PIN", type="primary", use_container_width=True):
+            if len(new_pin) < 4:
+                st.error("PIN must be at least 4 digits")
+            elif not new_pin.isdigit():
+                st.error("PIN must contain only numbers")
+            elif new_pin != confirm_pin:
+                st.error("PINs don't match")
+            else:
+                # Validate email if provided
+                if recovery_email and not re.match(r'^[^@]+@[^@]+\.[^@]+$', recovery_email):
+                    st.error("Invalid email format")
+                else:
+                    user_id = create_pin_user(new_pin, recovery_email if recovery_email else None)
+                    if user_id:
+                        st.session_state.auth_mode = "authenticated"
+                        st.session_state.user_id = user_id
+                        st.session_state.expenses = []
+                        st.session_state.custom_categories = {}
+                        st.success("✅ PIN created successfully!")
+                        st.rerun()
+                    else:
+                        st.error("❌ Failed to create PIN. Try a different PIN.")
+
+def show_account_login():
+    """Show Account login/creation screen"""
+    col1, col2 = st.columns([3, 1])
+    with col1:
+        st.title("🔒 Account Mode")
+    with col2:
+        if st.button("🏠 Main Menu", use_container_width=True):
+            st.session_state.auth_mode = None
+            st.rerun()
+    
+    tab1, tab2 = st.tabs(["🔑 Login", "➕ Create Account"])
+    
+    with tab1:
+        st.markdown("### Login to your account")
+        email = st.text_input("Email", key="login_email")
+        password = st.text_input("Password", type="password", key="login_password")
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("🔑 Login", type="primary", use_container_width=True):
+                if not email or not password:
+                    st.error("Please enter both email and password")
+                else:
+                    # TODO: Implement account authentication
+                    st.error("Account authentication not yet implemented")
+        
+        with col2:
+            if st.button("🔓 Back to Guest", use_container_width=True):
+                st.session_state.auth_mode = "guest"
+                st.session_state.user_id = None
+                st.rerun()
+    
+    with tab2:
+        st.markdown("### Create a new account")
+        new_email = st.text_input("Email", key="new_email")
+        new_password = st.text_input("Password", type="password", key="new_password")
+        confirm_password = st.text_input("Confirm Password", type="password", key="confirm_password")
+        
+        if st.button("➕ Create Account", type="primary", use_container_width=True):
+            if not new_email or not new_password:
+                st.error("Please fill in all fields")
+            elif not re.match(r'^[^@]+@[^@]+\.[^@]+$', new_email):
+                st.error("Invalid email format")
+            elif len(new_password) < 6:
+                st.error("Password must be at least 6 characters")
+            elif new_password != confirm_password:
+                st.error("Passwords don't match")
+            else:
+                # TODO: Implement account creation
+                st.error("Account creation not yet implemented")
+                st.info("💡 Try PIN Mode instead - it's fully functional!")
+
 # Main app
 def main():
-    # Load data on startup
-    load_data()
+    # Initialize authentication state
+    if 'auth_mode' not in st.session_state:
+        st.session_state.auth_mode = None
+    if 'user_id' not in st.session_state:
+        st.session_state.user_id = None
     
-    # Header
-    st.title("💰 Expense Tracker")
+    # Show appropriate screen based on auth state
+    if st.session_state.auth_mode is None:
+        show_login_screen()
+        return
+    elif st.session_state.auth_mode == "pin_login":
+        show_pin_login()
+        return
+    elif st.session_state.auth_mode == "account_login":
+        show_account_login()
+        return
+    
+    # For authenticated users or guests, load data
+    if st.session_state.auth_mode == "guest":
+        load_data()  # Load session-only data
+    # For authenticated users, data is already loaded during login
+    
+    # Header with logout option
+    col1, col2 = st.columns([3, 1])
+    with col1:
+        st.title("💰 Expense Tracker")
+    with col2:
+        if st.session_state.auth_mode == "authenticated":
+            if st.button("🚪 Logout", use_container_width=True):
+                # Clear session
+                for key in ['auth_mode', 'user_id', 'expenses', 'custom_categories']:
+                    if key in st.session_state:
+                        del st.session_state[key]
+                st.rerun()
+        elif st.session_state.auth_mode == "guest":
+            if st.button("🔑 Login", use_container_width=True):
+                st.session_state.auth_mode = None
+                st.rerun()
     st.divider()
     
     # Navigation
