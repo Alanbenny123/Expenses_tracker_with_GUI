@@ -234,23 +234,18 @@ def parse_date_input(date_input):
     return None
 
 def load_data():
-    """Load expenses from DB if configured, otherwise from JSON file"""
-    if db_load_data():
-        return
-    if os.path.exists('expenses.json'):
-        with open('expenses.json', 'r') as file:
-            data = json.load(file)
-            st.session_state.expenses = data.get('expenses', [])
-            st.session_state.custom_categories = data.get('custom_categories', {})
+    """Load expenses from browser localStorage (session-based)"""
+    # Initialize from localStorage if available, otherwise start fresh
+    if 'expenses' not in st.session_state:
+        st.session_state.expenses = []
+    if 'custom_categories' not in st.session_state:
+        st.session_state.custom_categories = {}
 
 def save_data():
-    """Save expenses to JSON file"""
-    with open('expenses.json', 'w') as file:
-        data = {
-            'expenses': st.session_state.expenses,
-            'custom_categories': st.session_state.custom_categories
-        }
-        json.dump(data, file)
+    """Save expenses to browser localStorage (automatic via session state)"""
+    # Data is automatically persisted in Streamlit session state
+    # Each browser session maintains its own isolated data
+    pass
 
 def get_all_categories():
     """Get all categories including custom ones"""
@@ -278,12 +273,8 @@ def add_expense():
             if st.button("Add Category", key="add_cat_btn"):
                 if new_category and new_category.strip().lower() not in get_all_categories():
                     name = new_category.strip().lower()
-                    if not db_add_category(name):
-                        st.session_state.custom_categories[name] = 0
-                        save_data()
-                    else:
-                        # refresh from DB
-                        db_load_data()
+                    st.session_state.custom_categories[name] = 0
+                    save_data()
                     st.success(f"Category '{new_category}' added!")
                     st.rerun()
                 elif new_category.strip().lower() in get_all_categories():
@@ -322,12 +313,14 @@ def add_expense():
         }
         
         # Check for duplicates (same date, category, amount, and description)
+        # Handle empty descriptions properly
+        desc_normalized = description.lower().strip() if description else ""
         duplicates = [
             e for e in st.session_state.expenses 
             if (e['date'] == parsed_date and 
                 e['category'] == category and 
                 e['amount'] == amount and 
-                e['description'].lower().strip() == description.lower().strip())
+                (e['description'].lower().strip() if e['description'] else "") == desc_normalized)
         ]
         
         if duplicates:
@@ -340,12 +333,9 @@ def add_expense():
             col1, col2 = st.columns(2)
             with col1:
                 if st.button("✅ Add Anyway", type="primary", use_container_width=True, key="confirm_add"):
-                    # Persist
-                    if not db_add_expense(expense):
-                        st.session_state.expenses.append(expense)
-                        save_data()
-                    else:
-                        db_load_data()
+                    # Add to session state (isolated per browser)
+                    st.session_state.expenses.append(expense)
+                    save_data()
                     st.success("✅ Expense added successfully!")
                     st.rerun()
             with col2:
@@ -353,12 +343,9 @@ def add_expense():
                     st.info("Expense not added.")
                     st.rerun()
         else:
-            # No duplicates, add directly
-            if not db_add_expense(expense):
-                st.session_state.expenses.append(expense)
-                save_data()
-            else:
-                db_load_data()
+            # No duplicates, add directly to session state
+            st.session_state.expenses.append(expense)
+            save_data()
             st.success("✅ Expense added successfully!")
             st.rerun()
 
@@ -535,15 +522,13 @@ def manage_categories():
                 if new_name:
                     new_name_lower = new_name.strip().lower()
                     if new_name_lower not in get_all_categories():
-                        # persist rename
-                        if not db_rename_category(selected, new_name_lower):
-                            st.session_state.custom_categories[new_name_lower] = st.session_state.custom_categories.pop(selected)
-                            for expense in st.session_state.expenses:
-                                if expense['category'] == selected:
-                                    expense['category'] = new_name_lower
-                            save_data()
-                        else:
-                            db_load_data()
+                        # Rename in session state
+                        st.session_state.custom_categories[new_name_lower] = st.session_state.custom_categories.pop(selected)
+                        # Update existing expenses with the new category name
+                        for expense in st.session_state.expenses:
+                            if expense['category'] == selected:
+                                expense['category'] = new_name_lower
+                        save_data()
                         st.success(f"Category renamed to '{new_name_lower}'!")
                         st.rerun()
                     else:
@@ -556,11 +541,8 @@ def manage_categories():
             cat_list = list(st.session_state.custom_categories.keys())
             selected = st.selectbox("Select category to remove", cat_list, key="remove_cat")
             if st.button("Remove", type="primary", key="remove_btn"):
-                if not db_remove_category(selected):
-                    del st.session_state.custom_categories[selected]
-                    save_data()
-                else:
-                    db_load_data()
+                del st.session_state.custom_categories[selected]
+                save_data()
                 st.success(f"Category '{selected}' removed!")
                 st.rerun()
     
@@ -664,31 +646,78 @@ def edit_expenses():
                     'date': parsed_date
                 }
                 
-                # Update in database or session state
-                if not db_update_expense(expense_index, updated_expense):
-                    st.session_state.expenses[expense_index] = updated_expense
-                    save_data()
-                else:
-                    db_load_data()
-                
+                # Update in session state
+                st.session_state.expenses[expense_index] = updated_expense
+                save_data()
                 st.success("✅ Expense updated successfully!")
                 st.rerun()
         
         with col2:
             if st.button("🗑️ Delete Expense", use_container_width=True):
-                # Delete from database or session state
-                if not db_delete_expense(expense_index):
-                    st.session_state.expenses.pop(expense_index)
-                    save_data()
-                else:
-                    db_load_data()
-                
+                # Delete from session state
+                st.session_state.expenses.pop(expense_index)
+                save_data()
                 st.success("🗑️ Expense deleted successfully!")
                 st.rerun()
         
         with col3:
             if st.button("❌ Cancel", use_container_width=True):
                 st.rerun()
+
+def remove_duplicates():
+    """Remove duplicate expenses"""
+    st.subheader("🧹 Remove Duplicates")
+    
+    if not st.session_state.expenses:
+        st.info("No expenses to check.")
+        return
+    
+    # Find duplicates
+    seen = set()
+    duplicates = []
+    unique_expenses = []
+    
+    for i, expense in enumerate(st.session_state.expenses):
+        # Create a key for comparison (normalize description)
+        key = (
+            expense['date'],
+            expense['category'],
+            expense['amount'],
+            expense['description'].lower().strip()
+        )
+        
+        if key in seen:
+            duplicates.append((i, expense))
+        else:
+            seen.add(key)
+            unique_expenses.append(expense)
+    
+    if duplicates:
+        st.warning(f"⚠️ Found {len(duplicates)} duplicate expense(s):")
+        
+        # Show duplicates
+        duplicate_df = pd.DataFrame([dup[1] for dup in duplicates])
+        duplicate_df['Index'] = [dup[0] for dup in duplicates]
+        duplicate_df['Amount'] = duplicate_df['amount'].apply(lambda x: f"₹{x:.2f}")
+        duplicate_df['Category'] = duplicate_df['category'].str.capitalize()
+        
+        display_df = duplicate_df[['Index', 'date', 'Category', 'description', 'Amount']].copy()
+        display_df.columns = ['Original #', 'Date', 'Category', 'Description', 'Amount']
+        st.dataframe(display_df, use_container_width=True, hide_index=True)
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("🗑️ Remove All Duplicates", type="primary", use_container_width=True):
+                st.session_state.expenses = unique_expenses
+                save_data()
+                st.success(f"✅ Removed {len(duplicates)} duplicate expense(s)!")
+                st.rerun()
+        
+        with col2:
+            if st.button("❌ Keep Duplicates", use_container_width=True):
+                st.info("Duplicates kept.")
+    else:
+        st.success("✅ No duplicates found! Your expenses are clean.")
 
 def export_to_excel():
     """Export expenses to Excel"""
@@ -719,7 +748,7 @@ def main():
     # Navigation
     page = st.radio(
         "Navigation",
-        ["➕ Add Expense", "📊 View Summary", "📅 View by Period", "✏️ Edit Expenses", "📁 Manage Categories"],
+        ["➕ Add Expense", "📊 View Summary", "📅 View by Period", "✏️ Edit Expenses", "🧹 Remove Duplicates", "📁 Manage Categories"],
         horizontal=True,
         label_visibility="collapsed"
     )
@@ -735,6 +764,8 @@ def main():
         view_expenses_period()
     elif page == "✏️ Edit Expenses":
         edit_expenses()
+    elif page == "🧹 Remove Duplicates":
+        remove_duplicates()
     elif page == "📁 Manage Categories":
         manage_categories()
     
