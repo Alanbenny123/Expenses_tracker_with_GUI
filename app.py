@@ -330,16 +330,20 @@ def add_expense():
             if len(duplicates) > 3:
                 st.write(f"... and {len(duplicates) - 3} more")
             
+            # Use unique keys with timestamp to avoid conflicts
+            import time
+            timestamp = str(int(time.time() * 1000))
+            
             col1, col2 = st.columns(2)
             with col1:
-                if st.button("✅ Add Anyway", type="primary", use_container_width=True, key="confirm_add"):
-                    # Add to session state (isolated per browser)
+                if st.button("✅ Add Anyway", type="primary", use_container_width=True, key=f"confirm_add_{timestamp}"):
+                    # Add to session state
                     st.session_state.expenses.append(expense)
                     save_data()
                     st.success("✅ Expense added successfully!")
                     st.rerun()
             with col2:
-                if st.button("❌ Cancel", use_container_width=True, key="cancel_add"):
+                if st.button("❌ Cancel", use_container_width=True, key=f"cancel_add_{timestamp}"):
                     st.info("Expense not added.")
                     st.rerun()
         else:
@@ -665,57 +669,99 @@ def edit_expenses():
                 st.rerun()
 
 def remove_duplicates():
-    """Remove duplicate expenses"""
+    """Remove duplicate expenses with selective deletion"""
     st.subheader("🧹 Remove Duplicates")
     
     if not st.session_state.expenses:
         st.info("No expenses to check.")
         return
     
-    # Find duplicates
-    seen = set()
-    duplicates = []
-    unique_expenses = []
+    # Find ALL duplicates (including originals)
+    duplicate_groups = {}
     
     for i, expense in enumerate(st.session_state.expenses):
         # Create a key for comparison (normalize description)
+        desc_normalized = expense['description'].lower().strip() if expense['description'] else ""
         key = (
             expense['date'],
             expense['category'],
             expense['amount'],
-            expense['description'].lower().strip()
+            desc_normalized
         )
         
-        if key in seen:
-            duplicates.append((i, expense))
-        else:
-            seen.add(key)
-            unique_expenses.append(expense)
+        if key not in duplicate_groups:
+            duplicate_groups[key] = []
+        duplicate_groups[key].append((i, expense))
     
-    if duplicates:
-        st.warning(f"⚠️ Found {len(duplicates)} duplicate expense(s):")
+    # Filter to only groups with duplicates (more than 1 item)
+    actual_duplicates = {k: v for k, v in duplicate_groups.items() if len(v) > 1}
+    
+    if actual_duplicates:
+        total_duplicates = sum(len(group) for group in actual_duplicates.values())
+        st.warning(f"⚠️ Found {len(actual_duplicates)} duplicate groups with {total_duplicates} total expenses:")
         
-        # Show duplicates
-        duplicate_df = pd.DataFrame([dup[1] for dup in duplicates])
-        duplicate_df['Index'] = [dup[0] for dup in duplicates]
-        duplicate_df['Amount'] = duplicate_df['amount'].apply(lambda x: f"₹{x:.2f}")
-        duplicate_df['Category'] = duplicate_df['category'].str.capitalize()
+        # Initialize selection state
+        if 'selected_for_deletion' not in st.session_state:
+            st.session_state.selected_for_deletion = set()
         
-        display_df = duplicate_df[['Index', 'date', 'Category', 'description', 'Amount']].copy()
-        display_df.columns = ['Original #', 'Date', 'Category', 'Description', 'Amount']
-        st.dataframe(display_df, use_container_width=True, hide_index=True)
+        # Show each duplicate group
+        for group_idx, (key, group) in enumerate(actual_duplicates.items()):
+            date, category, amount, description = key
+            st.write(f"**Group {group_idx + 1}:** {category.capitalize()} - ₹{amount:.2f} on {date}")
+            if description:
+                st.write(f"Description: {description}")
+            
+            # Show all items in this group with checkboxes
+            for item_idx, (original_idx, expense) in enumerate(group):
+                col1, col2 = st.columns([1, 10])
+                with col1:
+                    selected = st.checkbox(
+                        "",
+                        key=f"delete_{original_idx}",
+                        value=original_idx in st.session_state.selected_for_deletion
+                    )
+                    if selected:
+                        st.session_state.selected_for_deletion.add(original_idx)
+                    elif original_idx in st.session_state.selected_for_deletion:
+                        st.session_state.selected_for_deletion.remove(original_idx)
+                
+                with col2:
+                    st.write(f"#{original_idx}: {expense['description']} - ₹{expense['amount']:.2f} on {expense['date']}")
+            
+            st.divider()
         
-        col1, col2 = st.columns(2)
+        # Action buttons
+        col1, col2, col3 = st.columns(3)
+        
         with col1:
-            if st.button("🗑️ Remove All Duplicates", type="primary", use_container_width=True):
-                st.session_state.expenses = unique_expenses
-                save_data()
-                st.success(f"✅ Removed {len(duplicates)} duplicate expense(s)!")
+            if st.button("✅ Select All Duplicates", use_container_width=True):
+                # Select all but keep one from each group (keep the first one)
+                for group in actual_duplicates.values():
+                    for i, (original_idx, _) in enumerate(group):
+                        if i > 0:  # Keep first, select rest for deletion
+                            st.session_state.selected_for_deletion.add(original_idx)
                 st.rerun()
         
         with col2:
-            if st.button("❌ Keep Duplicates", use_container_width=True):
-                st.info("Duplicates kept.")
+            if st.button("❌ Clear Selection", use_container_width=True):
+                st.session_state.selected_for_deletion.clear()
+                st.rerun()
+        
+        with col3:
+            selected_count = len(st.session_state.selected_for_deletion)
+            if selected_count > 0:
+                if st.button(f"🗑️ Delete Selected ({selected_count})", type="primary", use_container_width=True):
+                    # Remove selected expenses (in reverse order to maintain indices)
+                    indices_to_remove = sorted(st.session_state.selected_for_deletion, reverse=True)
+                    for idx in indices_to_remove:
+                        st.session_state.expenses.pop(idx)
+                    
+                    st.session_state.selected_for_deletion.clear()
+                    save_data()
+                    st.success(f"✅ Deleted {selected_count} expense(s)!")
+                    st.rerun()
+            else:
+                st.button("🗑️ Delete Selected (0)", disabled=True, use_container_width=True)
     else:
         st.success("✅ No duplicates found! Your expenses are clean.")
 
