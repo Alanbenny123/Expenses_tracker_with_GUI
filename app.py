@@ -282,17 +282,22 @@ def add_expense():
         return
     
     with col2:
-        amount = st.number_input("Amount (₹)", min_value=0.0, step=0.01, key="add_amount")
+        amount = st.number_input("💰 Amount (₹)", min_value=0.01, step=0.01, key="add_amount")
     
     description = st.text_input("Description", key="add_desc")
     
     date_input = st.text_input(
-        "Date (YYYY-MM-DD or DD or YY-MM-DD or MM-DD)",
-        placeholder="e.g., 15 or 24-01-15",
+        "📅 Date (DD/MM-DD/YY-MM-DD/YYYY-MM-DD)",
+        placeholder="e.g., 15 or 01-15 or 24-01-15 or 2024-01-15",
         key="add_date"
     )
     
     if st.button("💾 Add Expense", type="primary", use_container_width=True):
+        # Validate amount
+        if amount <= 0:
+            st.error("⚠️ Please enter an amount greater than zero!")
+            return
+            
         if not date_input:
             st.error("Please enter a date")
             return
@@ -487,7 +492,7 @@ def display_expenses(expenses_list, title="Expenses"):
     df['Amount'] = df['amount'].apply(lambda x: f"₹{x:.2f}")
     df['Category'] = df['category'].str.capitalize()
     df = df[['date', 'Category', 'description', 'Amount']]
-    df.columns = ['Date', 'Category', 'Description', 'Amount']
+    df.columns = ['Date (DD/MM-DD/YY-MM-DD/YYYY-MM-DD)', 'Category', 'Description', 'Amount']
     st.dataframe(df, use_container_width=True, hide_index=True)
 
 def manage_categories():
@@ -573,7 +578,7 @@ def edit_expenses():
     df['Description'] = df['description']
     
     display_df = df[['index', 'Date', 'Category', 'Description', 'Amount']].copy()
-    display_df.columns = ['#', 'Date', 'Category', 'Description', 'Amount']
+    display_df.columns = ['#', 'Date (DD/MM-DD/YY-MM-DD/YYYY-MM-DD)', 'Category', 'Description', 'Amount']
     
     st.write("**Select an expense to edit:**")
     st.dataframe(display_df, use_container_width=True, hide_index=True)
@@ -763,7 +768,14 @@ def remove_duplicates():
             else:
                 st.button("🗑️ Delete Selected (0)", disabled=True, use_container_width=True)
     else:
+        # Show some debug info
         st.success("✅ No duplicates found! Your expenses are clean.")
+        if st.checkbox("🔍 Show debug info", key="debug_duplicates"):
+            st.write(f"**Total expenses:** {len(st.session_state.expenses)}")
+            if st.session_state.expenses:
+                st.write("**Recent expenses:**")
+                for i, exp in enumerate(st.session_state.expenses[-5:]):
+                    st.write(f"{i}: {exp['date']} | {exp['category']} | {exp['description']} | ₹{exp['amount']}")
 
 def export_to_excel():
     """Export expenses to Excel"""
