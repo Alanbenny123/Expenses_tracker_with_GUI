@@ -1,4 +1,5 @@
 import json
+import math
 import os
 from datetime import datetime, timedelta
 import pandas as pd
@@ -1049,7 +1050,10 @@ def edit_expenses():
             # Category selection
             all_categories = get_all_categories()
             category_list = list(all_categories.keys())
-            current_category_idx = category_list.index(expense['category']) if expense['category'] in category_list else 0
+            # Keep historical expenses in a removed category unless the user changes it.
+            if expense['category'] not in category_list:
+                category_list.append(expense['category'])
+            current_category_idx = category_list.index(expense['category'])
             
             new_category = st.selectbox(
                 "Category",
@@ -1083,6 +1087,9 @@ def edit_expenses():
         
         with col1:
             if st.button("💾 Save Changes", type="primary", use_container_width=True):
+                if not math.isfinite(new_amount) or new_amount <= 0:
+                    st.error("Amount must be a finite number greater than zero")
+                    return
                 # Parse the new date
                 parsed_date = parse_date_input(new_date_input)
                 if parsed_date is None:

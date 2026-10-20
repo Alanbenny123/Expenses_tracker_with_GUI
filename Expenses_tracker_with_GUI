@@ -2,6 +2,7 @@
 import json
 import math
 import os
+import tempfile
 from datetime import datetime, timedelta
 import pandas as pd
 import tkinter as tk
@@ -105,9 +106,21 @@ def le():
             custom_categories = data.get('custom_categories', {})
 
 def se():
-    with open(DATA_FILE, 'w', encoding='utf-8') as file:
-        data = {'expenses': expenses, 'custom_categories': custom_categories}
-        json.dump(data, file)
+    data = {'expenses': expenses, 'custom_categories': custom_categories}
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode='w', encoding='utf-8', dir=os.path.dirname(DATA_FILE),
+            prefix='.expenses-', suffix='.tmp', delete=False,
+        ) as file:
+            temporary_path = file.name
+            json.dump(data, file, allow_nan=False)
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(temporary_path, DATA_FILE)
+    finally:
+        if temporary_path and os.path.exists(temporary_path):
+            os.unlink(temporary_path)
 
 def am():
     category = cc()
@@ -352,6 +365,9 @@ def manage_categories():
                     messagebox.showerror("Error", "Category name already exists.", parent=root)
                 else:
                     custom_categories[new_name] = custom_categories.pop(category_name)
+                    for expense in expenses:
+                        if expense['category'] == category_name:
+                            expense['category'] = new_name
                     messagebox.showinfo("Success", f"Category '{category_name}' renamed to '{new_name}'.", parent=root)
             except (ValueError, IndexError):
                 messagebox.showerror("Error", "Invalid selection.", parent=root)

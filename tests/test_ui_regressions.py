@@ -9,6 +9,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -91,6 +92,44 @@ class FakeAccountStreamlit(FakeStreamlit):
 
     def text_input(self, label, **kwargs):
         return self.inputs.get(kwargs.get("key"), "")
+
+
+class FakeDataFrame:
+    def __init__(self, rows):
+        self.index = range(len(rows))
+        self.str = self
+
+    def __getitem__(self, key):
+        return self
+
+    def __setitem__(self, key, value):
+        pass
+
+    def apply(self, function):
+        return self
+
+    def capitalize(self):
+        return self
+
+    def copy(self):
+        return self
+
+
+class FakeEditStreamlit(FakeStreamlit):
+    def __init__(self):
+        super().__init__()
+        self.amount = 0.0
+        self.category_options = None
+
+    def dataframe(self, *args, **kwargs):
+        pass
+
+    def number_input(self, label, **kwargs):
+        return self.amount if label == "Amount (₹)" else 0
+
+    def selectbox(self, label, options, **kwargs):
+        self.category_options = options
+        return options[kwargs["index"]]
 
 
 class UiRegressionTests(unittest.TestCase):
@@ -184,6 +223,47 @@ class UiRegressionTests(unittest.TestCase):
                 self.assertEqual(desktop["custom_categories"], {"food": 0})
                 self.assertEqual(len(errors), 1)
 
+    def test_desktop_category_rename_updates_existing_expenses(self):
+        choices = iter((2, 1, None))
+        desktop = {
+            "categories": {"groceries": 0},
+            "custom_categories": {"food": 0},
+            "expenses": [
+                {"category": "food", "amount": 12},
+                {"category": "groceries", "amount": 5},
+            ],
+            "root": object(),
+            "ask_integer_input": lambda *args: next(choices),
+            "ask_string_input": lambda *args: " dining ",
+            "messagebox": SimpleNamespace(showerror=lambda *args, **kwargs: None,
+                                          showinfo=lambda *args, **kwargs: None),
+        }
+        load_functions(ROOT / "Expenses_tracker_with_GUI", {"manage_categories"}, desktop)
+        desktop["manage_categories"]()
+        self.assertEqual(desktop["custom_categories"], {"dining": 0})
+        self.assertEqual([item["category"] for item in desktop["expenses"]],
+                         ["dining", "groceries"])
+
+    def test_web_edit_preserves_removed_category_and_rejects_zero_amount(self):
+        fake = FakeEditStreamlit()
+        fake.session_state.expenses[0]["category"] = "former"
+        fake.clicked = {"💾 Save Changes"}
+        edits = {"st": fake, "pd": SimpleNamespace(DataFrame=FakeDataFrame),
+                 "math": math, "get_all_categories": lambda: {"groceries": 0},
+                 "parse_date_input": lambda value: value,
+                 "invalidate_duplicate_selection": lambda: None}
+        load_functions(ROOT / "app.py", {"edit_expenses"}, edits)
+        edits["edit_expenses"]()
+        self.assertEqual(fake.category_options, ["groceries", "former"])
+        self.assertEqual(fake.session_state.expenses[0]["amount"], 12.0)
+        self.assertIn(("error", "Amount must be a finite number greater than zero"), fake.messages)
+
+        fake.amount = 20.0
+        with self.assertRaises(Rerun):
+            edits["edit_expenses"]()
+        self.assertEqual(fake.session_state.expenses[0]["category"], "former")
+        self.assertEqual(fake.session_state.expenses[0]["amount"], 20.0)
+
     def test_account_screen_registers_and_logs_in(self):
         for action in ("➕ Create Account", "🔑 Login"):
             with self.subTest(action=action):
@@ -243,7 +323,7 @@ class UiRegressionTests(unittest.TestCase):
             data_file = os.path.join(app_dir, "expenses.json")
             with open(os.path.join(old_dir, "expenses.json"), "w", encoding="utf-8") as file:
                 json.dump({"expenses": [{"amount": 12}], "custom_categories": {"food": 0}}, file)
-            desktop = {"os": os, "json": json, "DATA_FILE": data_file,
+            desktop = {"os": os, "json": json, "tempfile": tempfile, "DATA_FILE": data_file,
                        "expenses": [], "custom_categories": {}}
             load_functions(ROOT / "Expenses_tracker_with_GUI", {"le", "se"}, desktop)
             previous_dir = os.getcwd()
@@ -259,6 +339,29 @@ class UiRegressionTests(unittest.TestCase):
                 self.assertEqual(desktop["expenses"], [{"amount": 12}])
             finally:
                 os.chdir(previous_dir)
+
+    def test_desktop_failed_save_preserves_existing_json(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            data_file = os.path.join(temp_dir, "expenses.json")
+            with open(data_file, "w", encoding="utf-8") as file:
+                json.dump({"expenses": [{"amount": 12}], "custom_categories": {}}, file)
+            desktop = {"os": os, "json": json, "tempfile": tempfile,
+                       "DATA_FILE": data_file, "expenses": [{"amount": object()}],
+                       "custom_categories": {}}
+            load_functions(ROOT / "Expenses_tracker_with_GUI", {"se"}, desktop)
+            with self.assertRaises(TypeError):
+                desktop["se"]()
+            with open(data_file, "r", encoding="utf-8") as file:
+                self.assertEqual(json.load(file)["expenses"], [{"amount": 12}])
+            self.assertEqual(os.listdir(temp_dir), ["expenses.json"])
+
+            desktop["expenses"] = [{"amount": 20}]
+            with patch.object(os, "replace", side_effect=OSError("disk error")):
+                with self.assertRaises(OSError):
+                    desktop["se"]()
+            with open(data_file, "r", encoding="utf-8") as file:
+                self.assertEqual(json.load(file)["expenses"], [{"amount": 12}])
+            self.assertEqual(os.listdir(temp_dir), ["expenses.json"])
 
     def test_devcontainer_keeps_streamlit_browser_protections(self):
         config = (ROOT / ".devcontainer" / "devcontainer.json").read_text()
