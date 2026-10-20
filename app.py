@@ -8,6 +8,7 @@ import hashlib
 import secrets
 import re
 import smtplib
+from hmac import compare_digest
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
@@ -73,10 +74,19 @@ def init_db():
                 recovery_email VARCHAR(255),
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 last_login TIMESTAMP,
+                failed_attempts INTEGER NOT NULL DEFAULT 0,
+                locked_until TIMESTAMP,
+                pin_reset_token_hash VARCHAR(64),
+                pin_reset_expires_at TIMESTAMP,
                 UNIQUE(pin_hash),
                 UNIQUE(email)
             );
         """))
+        # Existing installations may have been created before these columns existed.
+        conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS failed_attempts INTEGER NOT NULL DEFAULT 0"))
+        conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS locked_until TIMESTAMP"))
+        conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS pin_reset_token_hash VARCHAR(64)"))
+        conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS pin_reset_expires_at TIMESTAMP"))
         
         # Create expenses table (now with user_id)
         conn.execute(text("""
@@ -101,104 +111,6 @@ def init_db():
                 UNIQUE(user_id, name)
             );
         """))
-
-
-def db_load_data():
-    """Load data from DB into session state."""
-    engine = get_engine()
-    if engine is None:
-        return False
-    init_db()
-    with engine.begin() as conn:
-        rows = conn.execute(text("SELECT amount, description, category, date FROM expenses ORDER BY date")).mappings().all()
-        st.session_state.expenses = [dict(r) for r in rows]
-        cat_rows = conn.execute(text("SELECT name FROM custom_categories ORDER BY name")).scalars().all()
-        st.session_state.custom_categories = {name: 0 for name in cat_rows}
-    return True
-
-
-def db_add_expense(expense):
-    engine = get_engine()
-    if engine is None:
-        return False
-    with engine.begin() as conn:
-        conn.execute(
-            text("INSERT INTO expenses(amount, description, category, date) VALUES(:a,:d,:c,:dt)"),
-            {"a": expense["amount"], "d": expense["description"], "c": expense["category"], "dt": expense["date"]},
-        )
-    return True
-
-
-def db_add_category(name):
-    engine = get_engine()
-    if engine is None:
-        return False
-    with engine.begin() as conn:
-        conn.execute(text("INSERT INTO custom_categories(name) VALUES(:n) ON CONFLICT (name) DO NOTHING"), {"n": name})
-    return True
-
-
-def db_rename_category(old_name, new_name):
-    engine = get_engine()
-    if engine is None:
-        return False
-    with engine.begin() as conn:
-        conn.execute(text("UPDATE custom_categories SET name=:new WHERE name=:old"), {"new": new_name, "old": old_name})
-        # Update existing expense rows to use the new category name
-        conn.execute(text("UPDATE expenses SET category=:new WHERE category=:old"), {"new": new_name, "old": old_name})
-    return True
-
-
-def db_remove_category(name):
-    engine = get_engine()
-    if engine is None:
-        return False
-    with engine.begin() as conn:
-        conn.execute(text("DELETE FROM custom_categories WHERE name=:n"), {"n": name})
-    return True
-
-
-def db_update_expense(index, expense):
-    """Update expense by index (requires loading expenses first to get the correct ID)"""
-    engine = get_engine()
-    if engine is None:
-        return False
-    
-    # Get all expenses to find the correct database ID for this index
-    with engine.begin() as conn:
-        rows = conn.execute(text("SELECT id FROM expenses ORDER BY date")).fetchall()
-        if index >= len(rows):
-            return False
-        
-        expense_id = rows[index][0]
-        conn.execute(
-            text("UPDATE expenses SET amount=:a, description=:d, category=:c, date=:dt WHERE id=:id"),
-            {
-                "a": expense["amount"],
-                "d": expense["description"], 
-                "c": expense["category"],
-                "dt": expense["date"],
-                "id": expense_id
-            }
-        )
-    return True
-
-
-def db_delete_expense(index):
-    """Delete expense by index (requires loading expenses first to get the correct ID)"""
-    engine = get_engine()
-    if engine is None:
-        return False
-    
-    # Get all expenses to find the correct database ID for this index
-    with engine.begin() as conn:
-        rows = conn.execute(text("SELECT id FROM expenses ORDER BY date")).fetchall()
-        if index >= len(rows):
-            return False
-        
-        expense_id = rows[index][0]
-        conn.execute(text("DELETE FROM expenses WHERE id=:id"), {"id": expense_id})
-    return True
 
 
 def parse_date_input(date_input):
@@ -264,18 +176,11 @@ def parse_date_input(date_input):
     return None
 
 def load_data():
-    """Load expenses from browser localStorage (session-based)"""
-    # Initialize from localStorage if available, otherwise start fresh
+    """Initialize guest data for this Streamlit session."""
     if 'expenses' not in st.session_state:
         st.session_state.expenses = []
     if 'custom_categories' not in st.session_state:
         st.session_state.custom_categories = {}
-
-def save_data():
-    """Save expenses to browser localStorage (automatic via session state)"""
-    # Data is automatically persisted in Streamlit session state
-    # Each browser session maintains its own isolated data
-    pass
 
 # Authentication Functions
 def hash_pin(pin):
@@ -289,7 +194,7 @@ def verify_pin(pin, stored_hash):
     try:
         salt, hash_hex = stored_hash.split(':')
         pin_hash = hashlib.pbkdf2_hmac('sha256', pin.encode(), salt.encode(), 100000)
-        return pin_hash.hex() == hash_hex
+        return compare_digest(pin_hash.hex(), hash_hex)
     except:
         return False
 
@@ -297,22 +202,7 @@ def create_pin_user(pin, recovery_email=None):
     """Create new PIN user"""
     engine = get_engine()
     if engine is None:
-        # Fallback for local testing without database
-        # Generate a fake user ID based on PIN hash
-        pin_hash = hash_pin(pin)
-        user_id = abs(hash(pin_hash)) % 10000  # Generate consistent ID from PIN
-        
-        # Store PIN info in session state for local testing
-        if 'local_users' not in st.session_state:
-            st.session_state.local_users = {}
-        
-        st.session_state.local_users[user_id] = {
-            'pin_hash': pin_hash,
-            'recovery_email': recovery_email,
-            'expenses': [],
-            'custom_categories': {}
-        }
-        return user_id
+        return None
     
     pin_hash = hash_pin(pin)
     
@@ -329,34 +219,38 @@ def create_pin_user(pin, recovery_email=None):
         st.error(f"Database error: {e}")
         return None
 
-def authenticate_pin(pin):
-    """Authenticate user with PIN"""
+def authenticate_pin(account_id, pin):
+    """Authenticate a specific account and limit repeated PIN guesses."""
     engine = get_engine()
     if engine is None:
-        # Fallback for local testing without database
-        if 'local_users' not in st.session_state:
-            return None
-        
-        for user_id, user_data in st.session_state.local_users.items():
-            if verify_pin(pin, user_data['pin_hash']):
-                return user_id
         return None
     
     try:
         with engine.begin() as conn:
-            result = conn.execute(text("""
-                SELECT id, pin_hash FROM users 
-                WHERE user_type = 'pin' AND pin_hash IS NOT NULL
-            """))
-            
-            for user_id, stored_hash in result:
-                if verify_pin(pin, stored_hash):
-                    # Update last login
-                    conn.execute(text("""
-                        UPDATE users SET last_login = CURRENT_TIMESTAMP 
-                        WHERE id = :user_id
-                    """), {"user_id": user_id})
-                    return user_id
+            row = conn.execute(text("""
+                SELECT id, pin_hash, failed_attempts,
+                       locked_until IS NOT NULL AND locked_until > CURRENT_TIMESTAMP AS is_locked,
+                       locked_until IS NOT NULL AND locked_until <= CURRENT_TIMESTAMP AS lock_expired
+                FROM users WHERE id = :account_id AND user_type = 'pin'
+                FOR UPDATE
+            """), {"account_id": account_id}).one_or_none()
+            if row is None or row.is_locked:
+                return None
+            if verify_pin(pin, row.pin_hash):
+                conn.execute(text("""
+                    UPDATE users SET last_login = CURRENT_TIMESTAMP,
+                        failed_attempts = 0, locked_until = NULL
+                    WHERE id = :account_id
+                """), {"account_id": account_id})
+                return account_id
+            attempts = 1 if row.lock_expired else row.failed_attempts + 1
+            conn.execute(text("""
+                UPDATE users SET failed_attempts = :attempts,
+                    locked_until = CASE WHEN :attempts >= 5
+                        THEN CURRENT_TIMESTAMP + INTERVAL '15 minutes'
+                        ELSE locked_until END
+                WHERE id = :account_id
+            """), {"account_id": account_id, "attempts": attempts})
         return None
     except Exception as e:
         st.error(f"Database error: {e}")
@@ -371,7 +265,7 @@ def get_user_data(user_id):
     with engine.begin() as conn:
         # Load expenses
         expenses_result = conn.execute(text("""
-            SELECT amount, description, category, date 
+            SELECT id, amount, description, category, date
             FROM expenses 
             WHERE user_id = :user_id 
             ORDER BY date DESC
@@ -379,10 +273,11 @@ def get_user_data(user_id):
         
         expenses = [
             {
-                'amount': float(row[0]),
-                'description': row[1] or '',
-                'category': row[2],
-                'date': row[3].strftime('%Y-%m-%d')
+                'id': row[0],
+                'amount': float(row[1]),
+                'description': row[2] or '',
+                'category': row[3],
+                'date': row[4].strftime('%Y-%m-%d')
             }
             for row in expenses_result
         ]
@@ -401,20 +296,20 @@ def save_user_expense(user_id, expense):
     """Save expense for specific user"""
     engine = get_engine()
     if engine is None:
-        return False
+        return None
     
     with engine.begin() as conn:
-        conn.execute(text("""
+        return conn.execute(text("""
             INSERT INTO expenses (user_id, amount, description, category, date)
             VALUES (:user_id, :amount, :description, :category, :date)
+            RETURNING id
         """), {
             "user_id": user_id,
             "amount": expense['amount'],
             "description": expense['description'],
             "category": expense['category'],
             "date": expense['date']
-        })
-    return True
+        }).scalar_one()
 
 def save_user_category(user_id, category_name):
     """Save custom category for specific user"""
@@ -430,8 +325,63 @@ def save_user_category(user_id, category_name):
         """), {"user_id": user_id, "name": category_name})
     return True
 
-def send_recovery_email(email, pin):
-    """Send PIN recovery email"""
+def update_user_expense(user_id, expense):
+    engine = get_engine()
+    if engine is None:
+        return False
+    with engine.begin() as conn:
+        result = conn.execute(text("""
+            UPDATE expenses SET amount = :amount, description = :description,
+                category = :category, date = :date
+            WHERE id = :id AND user_id = :user_id
+        """), {**expense, "user_id": user_id})
+        return result.rowcount == 1
+
+def delete_user_expenses(user_id, expense_ids):
+    engine = get_engine()
+    if engine is None:
+        return False
+    try:
+        with engine.begin() as conn:
+            for expense_id in expense_ids:
+                result = conn.execute(text("""
+                    DELETE FROM expenses WHERE id = :id AND user_id = :user_id
+                """), {"id": expense_id, "user_id": user_id})
+                if result.rowcount != 1:
+                    raise ValueError("Expense was not found for this account")
+        return True
+    except ValueError:
+        return False
+
+def rename_user_category(user_id, old_name, new_name):
+    engine = get_engine()
+    if engine is None:
+        return False
+    with engine.begin() as conn:
+        result = conn.execute(text("""
+            UPDATE custom_categories SET name = :new_name
+            WHERE user_id = :user_id AND name = :old_name
+        """), {"user_id": user_id, "old_name": old_name, "new_name": new_name})
+        if result.rowcount != 1:
+            return False
+        conn.execute(text("""
+            UPDATE expenses SET category = :new_name
+            WHERE user_id = :user_id AND category = :old_name
+        """), {"user_id": user_id, "old_name": old_name, "new_name": new_name})
+    return True
+
+def remove_user_category(user_id, name):
+    engine = get_engine()
+    if engine is None:
+        return False
+    with engine.begin() as conn:
+        result = conn.execute(text("""
+            DELETE FROM custom_categories WHERE user_id = :user_id AND name = :name
+        """), {"user_id": user_id, "name": name})
+        return result.rowcount == 1
+
+def send_recovery_email(email, subject, body):
+    """Send an account access message only to the configured email address."""
     try:
         gmail_user = os.getenv('GMAIL_USER')
         gmail_password = os.getenv('GMAIL_APP_PASSWORD')
@@ -443,22 +393,7 @@ def send_recovery_email(email, pin):
         msg = MIMEMultipart()
         msg['From'] = gmail_user
         msg['To'] = email
-        msg['Subject'] = "💰 Expense Tracker - PIN Recovery"
-        
-        body = f"""
-        Hello!
-        
-        You requested to recover your PIN for the Expense Tracker app.
-        
-        Your PIN is: {pin}
-        
-        Please keep this PIN safe and secure.
-        
-        If you didn't request this, please ignore this email.
-        
-        Best regards,
-        Expense Tracker Team
-        """
+        msg['Subject'] = subject
         
         msg.attach(MIMEText(body, 'plain'))
         
@@ -475,50 +410,106 @@ def send_recovery_email(email, pin):
     except Exception as e:
         return False, f"Failed to send email: {str(e)}"
 
-def recover_pin_by_email(email):
-    """Recover PIN using recovery email"""
+def send_account_ids_by_email(email):
+    """Email account IDs to their registered recovery address."""
     engine = get_engine()
     if engine is None:
-        # Fallback for local testing without database
-        if 'local_users' not in st.session_state:
-            return None, "No users found"
-        
-        for user_id, user_data in st.session_state.local_users.items():
-            if user_data.get('recovery_email') == email:
-                # For local testing, return the demo PIN
-                return "1234", "local_demo"
-        return None, "Email not found"
-    
+        return False
     try:
         with engine.begin() as conn:
-            result = conn.execute(text("""
-                SELECT id, pin_hash FROM users 
+            ids = conn.execute(text("""
+                SELECT id FROM users
                 WHERE recovery_email = :email AND user_type = 'pin'
-            """), {"email": email})
-            
-            row = result.fetchone()
-            if row:
-                user_id, pin_hash = row
-                # In production, we need to generate a temporary PIN or reset token
-                # For now, we'll create a temporary 6-digit PIN
-                temp_pin = secrets.randbelow(900000) + 100000  # 6-digit number
-                temp_pin_str = str(temp_pin)
-                
-                # Update user with temporary PIN hash
-                new_pin_hash = hash_pin(temp_pin_str)
+            """), {"email": email}).scalars().all()
+        if not ids:
+            return True
+        body = "Your Expense Tracker account IDs: " + ", ".join(map(str, ids))
+        sent, _ = send_recovery_email(email, "Expense Tracker account IDs", body)
+        return sent
+    except Exception:
+        return False
+
+def request_pin_reset(account_id, email):
+    """Issue a short-lived, single-use reset code without changing the PIN."""
+    engine = get_engine()
+    if engine is None:
+        return False
+    try:
+        with engine.begin() as conn:
+            found = conn.execute(text("""
+                SELECT id FROM users WHERE id = :id AND recovery_email = :email
+                    AND user_type = 'pin'
+            """), {"id": account_id, "email": email}).scalar_one_or_none()
+            if found is None:
+                return True
+            code = secrets.token_urlsafe(24)
+            code_hash = hashlib.sha256(code.encode()).hexdigest()
+            conn.execute(text("""
+                UPDATE users SET pin_reset_token_hash = :code_hash,
+                    pin_reset_expires_at = CURRENT_TIMESTAMP + INTERVAL '15 minutes'
+                WHERE id = :id
+            """), {"id": account_id, "code_hash": code_hash})
+        sent, _ = send_recovery_email(
+            email, "Expense Tracker PIN reset code",
+            f"Account ID: {account_id}\nReset code: {code}\nThis code expires in 15 minutes."
+        )
+        if not sent:
+            with engine.begin() as conn:
                 conn.execute(text("""
-                    UPDATE users SET pin_hash = :new_hash 
-                    WHERE id = :user_id
-                """), {"new_hash": new_pin_hash, "user_id": user_id})
-                
-                return temp_pin_str, "database"
-            return None, "Email not found"
-    except Exception as e:
-        return None, f"Database error: {str(e)}"
+                    UPDATE users SET pin_reset_token_hash = NULL,
+                        pin_reset_expires_at = NULL
+                    WHERE id = :id AND pin_reset_token_hash = :code_hash
+                """), {"id": account_id, "code_hash": code_hash})
+        return sent
+    except Exception:
+        return False
+
+def reset_pin(account_id, email, code, new_pin):
+    """Consume a valid reset code and set a new PIN atomically."""
+    engine = get_engine()
+    if engine is None:
+        return False
+    try:
+        with engine.begin() as conn:
+            row = conn.execute(text("""
+                SELECT pin_reset_token_hash,
+                    pin_reset_expires_at > CURRENT_TIMESTAMP AS token_valid
+                FROM users WHERE id = :id AND recovery_email = :email
+                    AND user_type = 'pin' FOR UPDATE
+            """), {"id": account_id, "email": email}).one_or_none()
+            if row is None or not row.token_valid or not row.pin_reset_token_hash:
+                return False
+            code_hash = hashlib.sha256(code.encode()).hexdigest()
+            if not compare_digest(code_hash, row.pin_reset_token_hash):
+                return False
+            conn.execute(text("""
+                UPDATE users SET pin_hash = :pin_hash,
+                    pin_reset_token_hash = NULL, pin_reset_expires_at = NULL,
+                    failed_attempts = 0, locked_until = NULL
+                WHERE id = :id
+            """), {"id": account_id, "pin_hash": hash_pin(new_pin)})
+            return True
+    except Exception:
+        return False
 
 def get_all_categories():
     """Get all categories including custom ones"""
     return {**categories, **st.session_state.custom_categories}
+
+def invalidate_duplicate_selection():
+    st.session_state.selected_for_deletion = set()
+    st.session_state.duplicate_generation = st.session_state.get('duplicate_generation', 0) + 1
+
+def record_expense(expense):
+    """Persist an expense before adding it to the visible session."""
+    if st.session_state.auth_mode == "authenticated":
+        expense_id = save_user_expense(st.session_state.user_id, expense)
+        if expense_id is None:
+            return False
+        expense = {**expense, "id": expense_id}
+    st.session_state.expenses.append(expense)
+    invalidate_duplicate_selection()
+    return True
 
 def add_expense():
     """Add expense form"""
@@ -542,13 +533,11 @@ def add_expense():
             if st.button("Add Category", key="add_cat_btn"):
                 if new_category and new_category.strip().lower() not in get_all_categories():
                     name = new_category.strip().lower()
+                    if st.session_state.auth_mode == "authenticated":
+                        if not save_user_category(st.session_state.user_id, name):
+                            st.error("Could not save the category")
+                            return
                     st.session_state.custom_categories[name] = 0
-                    
-                    # Save to database if authenticated user
-                    if st.session_state.auth_mode == "authenticated" and st.session_state.user_id:
-                        save_user_category(st.session_state.user_id, name)
-                    else:
-                        save_data()  # Save to session for guest mode
                     
                     st.success(f"Category '{new_category}' added!")
                     st.rerun()
@@ -567,31 +556,30 @@ def add_expense():
         key="add_date"
     )
     
+    parsed_date = parse_date_input(date_input) if date_input else None
+    current_expense = {
+        'amount': amount,
+        'description': description,
+        'category': category,
+        'date': parsed_date,
+    } if parsed_date else None
+    owner = (st.session_state.auth_mode, st.session_state.user_id)
+    pending = st.session_state.get('pending_duplicate')
+    if pending and (pending['owner'] != owner or pending['expense'] != current_expense):
+        del st.session_state.pending_duplicate
+        pending = None
+
     if st.button("💾 Add Expense", type="primary", use_container_width=True):
-        # Validate amount
         if amount <= 0:
             st.error("⚠️ Please enter an amount greater than zero!")
             return
-            
         if not date_input:
             st.error("Please enter a date")
             return
-        
-        parsed_date = parse_date_input(date_input)
         if parsed_date is None:
-            try:
-                parsed_date = datetime.strptime(date_input, "%Y-%m-%d").strftime("%Y-%m-%d")
-            except ValueError:
-                st.error("Invalid date format. Use: DD, YY-MM-DD, MM-DD, or YYYY-MM-DD")
-                return
-        
-        expense = {
-            'amount': amount,
-            'description': description,
-            'category': category,
-            'date': parsed_date
-        }
-        
+            st.error("Invalid date format. Use: DD, YY-MM-DD, MM-DD, or YYYY-MM-DD")
+            return
+
         # Check for duplicates (same date, category, and amount - ignore description)
         duplicates = [
             e for e in st.session_state.expenses 
@@ -599,48 +587,40 @@ def add_expense():
                 e['category'] == category and 
                 e['amount'] == amount)
         ]
-        
         if duplicates:
-            st.warning(f"⚠️ Found {len(duplicates)} identical expense(s) with the same date, category, and amount:")
-            for i, dup in enumerate(duplicates[:3], 1):  # Show max 3 duplicates
-                st.write(f"{i}. {dup['description']} - ₹{dup['amount']:.2f} on {dup['date']} ({dup['category'].capitalize()})")
-            if len(duplicates) > 3:
-                st.write(f"... and {len(duplicates) - 3} more")
-            
-            # Use unique keys with timestamp to avoid conflicts
-            import time
-            timestamp = str(int(time.time() * 1000))
-            
-            col1, col2 = st.columns(2)
-            with col1:
-                if st.button("✅ Add Anyway", type="primary", use_container_width=True, key=f"confirm_add_{timestamp}"):
-                    # Add expense
-                    st.session_state.expenses.append(expense)
-                    
-                    # Save to database if authenticated user
-                    if st.session_state.auth_mode == "authenticated" and st.session_state.user_id:
-                        save_user_expense(st.session_state.user_id, expense)
-                    else:
-                        save_data()  # Save to session for guest mode
-                    
+            st.session_state.pending_duplicate = {'expense': current_expense, 'owner': owner}
+            st.rerun()
+        else:
+            if record_expense(current_expense):
+                st.success("✅ Expense added successfully!")
+                st.rerun()
+            st.error("Could not save this expense")
+
+    pending = st.session_state.get('pending_duplicate')
+    if pending:
+        expense = pending['expense']
+        duplicates = [
+            e for e in st.session_state.expenses
+            if e['date'] == expense['date'] and e['category'] == expense['category']
+            and e['amount'] == expense['amount']
+        ]
+        st.warning(f"⚠️ Found {len(duplicates)} expense(s) with the same date, category, and amount:")
+        for i, dup in enumerate(duplicates[:3], 1):
+            st.write(f"{i}. {dup['description']} - ₹{dup['amount']:.2f} on {dup['date']} ({dup['category'].capitalize()})")
+        st.write(f"Add this expense anyway? {expense['description']} - ₹{expense['amount']:.2f} on {expense['date']}")
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("✅ Add Anyway", type="primary", use_container_width=True):
+                if record_expense(expense):
+                    del st.session_state.pending_duplicate
                     st.success("✅ Expense added successfully!")
                     st.rerun()
-            with col2:
-                if st.button("❌ Cancel", use_container_width=True, key=f"cancel_add_{timestamp}"):
-                    st.info("Expense not added.")
-                    st.rerun()
-        else:
-            # No duplicates, add expense
-            st.session_state.expenses.append(expense)
-            
-            # Save to database if authenticated user
-            if st.session_state.auth_mode == "authenticated" and st.session_state.user_id:
-                save_user_expense(st.session_state.user_id, expense)
-            else:
-                save_data()  # Save to session for guest mode
-            
-            st.success("✅ Expense added successfully!")
-            st.rerun()
+                st.error("Could not save this expense")
+        with col2:
+            if st.button("❌ Cancel", use_container_width=True):
+                del st.session_state.pending_duplicate
+                st.info("Expense not added.")
+                st.rerun()
 
 def view_summary():
     """View expense summary"""
@@ -794,13 +774,14 @@ def manage_categories():
             if new_cat:
                 cat_name = new_cat.strip().lower()
                 if cat_name not in get_all_categories():
-                    if not db_add_category(cat_name):
-                        st.session_state.custom_categories[cat_name] = 0
-                        save_data()
+                    if not cat_name:
+                        st.error("Category name cannot be empty")
+                    elif st.session_state.auth_mode == "authenticated" and not save_user_category(st.session_state.user_id, cat_name):
+                        st.error("Could not save the category")
                     else:
-                        db_load_data()
-                    st.success(f"Category '{cat_name}' added!")
-                    st.rerun()
+                        st.session_state.custom_categories[cat_name] = 0
+                        st.success(f"Category '{cat_name}' added!")
+                        st.rerun()
                 else:
                     st.error("Category already exists!")
     
@@ -815,15 +796,18 @@ def manage_categories():
                 if new_name:
                     new_name_lower = new_name.strip().lower()
                     if new_name_lower not in get_all_categories():
-                        # Rename in session state
-                        st.session_state.custom_categories[new_name_lower] = st.session_state.custom_categories.pop(selected)
-                        # Update existing expenses with the new category name
-                        for expense in st.session_state.expenses:
-                            if expense['category'] == selected:
-                                expense['category'] = new_name_lower
-                        save_data()
-                        st.success(f"Category renamed to '{new_name_lower}'!")
-                        st.rerun()
+                        if not new_name_lower:
+                            st.error("Category name cannot be empty")
+                        elif st.session_state.auth_mode == "authenticated" and not rename_user_category(st.session_state.user_id, selected, new_name_lower):
+                            st.error("Could not rename the category")
+                        else:
+                            st.session_state.custom_categories[new_name_lower] = st.session_state.custom_categories.pop(selected)
+                            for expense in st.session_state.expenses:
+                                if expense['category'] == selected:
+                                    expense['category'] = new_name_lower
+                            invalidate_duplicate_selection()
+                            st.success(f"Category renamed to '{new_name_lower}'!")
+                            st.rerun()
                     else:
                         st.error("Category name already exists!")
     
@@ -834,10 +818,12 @@ def manage_categories():
             cat_list = list(st.session_state.custom_categories.keys())
             selected = st.selectbox("Select category to remove", cat_list, key="remove_cat")
             if st.button("Remove", type="primary", key="remove_btn"):
-                del st.session_state.custom_categories[selected]
-                save_data()
-                st.success(f"Category '{selected}' removed!")
-                st.rerun()
+                if st.session_state.auth_mode == "authenticated" and not remove_user_category(st.session_state.user_id, selected):
+                    st.error("Could not remove the category")
+                else:
+                    del st.session_state.custom_categories[selected]
+                    st.success(f"Category '{selected}' removed!")
+                    st.rerun()
     
     elif option == "View All Categories":
         all_cats = get_all_categories()
@@ -878,6 +864,10 @@ def edit_expenses():
     
     if expense_index < len(st.session_state.expenses):
         expense = st.session_state.expenses[expense_index]
+        if st.session_state.auth_mode == "authenticated":
+            edit_key = f"{st.session_state.user_id}_{expense['id']}"
+        else:
+            edit_key = f"guest_{expense_index}_{st.session_state.get('duplicate_generation', 0)}"
         
         st.divider()
         st.write(f"**Editing Expense #{expense_index}**")
@@ -894,7 +884,7 @@ def edit_expenses():
                 "Category",
                 category_list,
                 index=current_category_idx,
-                key="edit_category"
+                key=f"edit_category_{edit_key}"
             )
         
         with col2:
@@ -903,19 +893,19 @@ def edit_expenses():
                 min_value=0.0,
                 step=0.01,
                 value=float(expense['amount']),
-                key="edit_amount"
+                key=f"edit_amount_{edit_key}"
             )
         
         new_description = st.text_input(
             "Description",
             value=expense['description'],
-            key="edit_description"
+            key=f"edit_description_{edit_key}"
         )
         
         new_date_input = st.text_input(
             "Date (YYYY-MM-DD or DD or YY-MM-DD or MM-DD)",
             value=expense['date'],
-            key="edit_date"
+            key=f"edit_date_{edit_key}"
         )
         
         col1, col2, col3 = st.columns(3)
@@ -938,18 +928,23 @@ def edit_expenses():
                     'category': new_category,
                     'date': parsed_date
                 }
-                
-                # Update in session state
+                if st.session_state.auth_mode == "authenticated":
+                    updated_expense['id'] = expense['id']
+                    if not update_user_expense(st.session_state.user_id, updated_expense):
+                        st.error("Could not save the changes")
+                        return
                 st.session_state.expenses[expense_index] = updated_expense
-                save_data()
+                invalidate_duplicate_selection()
                 st.success("✅ Expense updated successfully!")
                 st.rerun()
         
         with col2:
             if st.button("🗑️ Delete Expense", use_container_width=True):
-                # Delete from session state
+                if st.session_state.auth_mode == "authenticated" and not delete_user_expenses(st.session_state.user_id, [expense['id']]):
+                    st.error("Could not delete the expense")
+                    return
                 st.session_state.expenses.pop(expense_index)
-                save_data()
+                invalidate_duplicate_selection()
                 st.success("🗑️ Expense deleted successfully!")
                 st.rerun()
         
@@ -990,6 +985,7 @@ def remove_duplicates():
         # Initialize selection state
         if 'selected_for_deletion' not in st.session_state:
             st.session_state.selected_for_deletion = set()
+        generation = st.session_state.get('duplicate_generation', 0)
         
         # Show each duplicate group
         for group_idx, (key, group) in enumerate(actual_duplicates.items()):
@@ -1002,7 +998,7 @@ def remove_duplicates():
                 with col1:
                     selected = st.checkbox(
                         "",
-                        key=f"delete_{original_idx}",
+                        key=f"delete_{generation}_{original_idx}",
                         value=original_idx in st.session_state.selected_for_deletion
                     )
                     if selected:
@@ -1025,11 +1021,13 @@ def remove_duplicates():
                     for i, (original_idx, _) in enumerate(group):
                         if i > 0:  # Keep first, select rest for deletion
                             st.session_state.selected_for_deletion.add(original_idx)
+                st.session_state.duplicate_generation = generation + 1
                 st.rerun()
         
         with col2:
             if st.button("❌ Clear Selection", use_container_width=True):
                 st.session_state.selected_for_deletion.clear()
+                st.session_state.duplicate_generation = generation + 1
                 st.rerun()
         
         with col3:
@@ -1038,11 +1036,16 @@ def remove_duplicates():
                 if st.button(f"🗑️ Delete Selected ({selected_count})", type="primary", use_container_width=True):
                     # Remove selected expenses (in reverse order to maintain indices)
                     indices_to_remove = sorted(st.session_state.selected_for_deletion, reverse=True)
+                    if st.session_state.auth_mode == "authenticated":
+                        expense_ids = [st.session_state.expenses[idx]['id'] for idx in indices_to_remove]
+                        if not delete_user_expenses(st.session_state.user_id, expense_ids):
+                            st.error("Could not delete the selected expenses")
+                            return
                     for idx in indices_to_remove:
                         st.session_state.expenses.pop(idx)
                     
                     st.session_state.selected_for_deletion.clear()
-                    save_data()
+                    st.session_state.duplicate_generation = generation + 1
                     st.success(f"✅ Deleted {selected_count} expense(s)!")
                     st.rerun()
             else:
@@ -1062,7 +1065,7 @@ def export_to_excel():
     if not st.session_state.expenses:
         st.warning("No expenses to export")
         return
-    df = pd.DataFrame(st.session_state.expenses)
+    df = pd.DataFrame(st.session_state.expenses)[['date', 'category', 'description', 'amount']]
     buffer = BytesIO()
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
         df.to_excel(writer, index=False)
@@ -1118,25 +1121,34 @@ def show_pin_login():
         if st.button("🏠 Main Menu", use_container_width=True):
             st.session_state.auth_mode = None
             st.rerun()
+
+    if get_engine() is None:
+        st.warning("PIN accounts require DATABASE_URL. Guest mode is available without a database.")
+        return
     
     tab1, tab2 = st.tabs(["🔑 Enter PIN", "➕ Create New PIN"])
     
     with tab1:
         st.markdown("### Enter your PIN to access your data")
+        account_id_input = st.text_input("Account ID", key="login_account_id")
         pin = st.text_input("PIN (4-6 digits)", type="password", max_chars=6, key="login_pin")
         
         col1, col2 = st.columns(2)
         with col1:
             if st.button("🔑 Login", type="primary", use_container_width=True):
-                if len(pin) < 4:
+                if not account_id_input.isdigit() or int(account_id_input) < 1:
+                    st.error("Enter your numeric account ID")
+                elif len(pin) < 4:
                     st.error("PIN must be at least 4 digits")
                 elif not pin.isdigit():
                     st.error("PIN must contain only numbers")
                 else:
-                    user_id = authenticate_pin(pin)
+                    user_id = authenticate_pin(int(account_id_input), pin)
                     if user_id:
                         st.session_state.auth_mode = "authenticated"
                         st.session_state.user_id = user_id
+                        st.session_state.selected_for_deletion = set()
+                        st.session_state.duplicate_generation = st.session_state.get('duplicate_generation', 0) + 1
                         # Load user data
                         expenses, custom_categories = get_user_data(user_id)
                         st.session_state.expenses = expenses
@@ -1154,47 +1166,44 @@ def show_pin_login():
         
         st.divider()
         
-        # Forgot PIN section
-        if st.button("🔑 Forgot PIN?", use_container_width=True):
+        if st.button("🔑 Forgot PIN or Account ID?", use_container_width=True):
             st.session_state.show_forgot_pin = True
             st.rerun()
         
         if st.session_state.get('show_forgot_pin', False):
-            st.markdown("### 🔑 Recover PIN")
+            st.markdown("### 🔑 Recover access")
             recovery_email_input = st.text_input("Enter your recovery email", key="recovery_email_input")
-            
-            col1, col2 = st.columns(2)
-            with col1:
-                if st.button("📧 Send Recovery", type="primary", use_container_width=True):
-                    if not recovery_email_input:
-                        st.error("Please enter your recovery email")
-                    elif not re.match(r'^[^@]+@[^@]+\.[^@]+$', recovery_email_input):
-                        st.error("Invalid email format")
-                    else:
-                        # Check if email exists and get PIN
-                        recovered_pin, source = recover_pin_by_email(recovery_email_input)
-                        if recovered_pin:
-                            if source == "local_demo":
-                                st.success(f"✅ Your PIN is: **{recovered_pin}**")
-                                st.info("💡 (Local demo mode - save this PIN!)")
-                            elif source == "database":
-                                # Try to send email
-                                email_sent, message = send_recovery_email(recovery_email_input, recovered_pin)
-                                if email_sent:
-                                    st.success("✅ New PIN sent to your email!")
-                                    st.info("📧 Check your inbox for the new PIN")
-                                else:
-                                    # Fallback: show PIN if email fails
-                                    st.warning(f"⚠️ Email failed: {message}")
-                                    st.success(f"✅ Your new PIN is: **{recovered_pin}**")
-                                    st.info("💡 Save this PIN somewhere safe!")
-                        else:
-                            st.error(f"❌ {source}")
-            
-            with col2:
-                if st.button("❌ Cancel", use_container_width=True):
-                    st.session_state.show_forgot_pin = False
-                    st.rerun()
+            recovery_account_id = st.text_input("Account ID for PIN reset", key="recovery_account_id")
+            if st.button("📧 Email my Account ID"):
+                if re.fullmatch(r'[^@\s]+@[^@\s]+\.[^@\s]+', recovery_email_input):
+                    send_account_ids_by_email(recovery_email_input)
+                    st.info("If this address is registered and email is configured, your account ID will arrive by email.")
+                else:
+                    st.error("Enter a valid recovery email")
+            if st.button("📧 Send PIN reset code"):
+                if not recovery_account_id.isdigit() or int(recovery_account_id) < 1:
+                    st.error("Enter your numeric account ID")
+                elif not re.fullmatch(r'[^@\s]+@[^@\s]+\.[^@\s]+', recovery_email_input):
+                    st.error("Enter a valid recovery email")
+                else:
+                    request_pin_reset(int(recovery_account_id), recovery_email_input)
+                    st.info("If these details match and email is configured, a reset code will arrive by email.")
+            reset_code = st.text_input("Reset code from email", key="pin_reset_code")
+            reset_pin_input = st.text_input("New PIN (4-6 digits)", type="password", max_chars=6, key="reset_pin")
+            if st.button("Set new PIN"):
+                if not recovery_account_id.isdigit() or int(recovery_account_id) < 1:
+                    st.error("Enter your numeric account ID")
+                elif not re.fullmatch(r'[^@\s]+@[^@\s]+\.[^@\s]+', recovery_email_input):
+                    st.error("Enter a valid recovery email")
+                elif not (4 <= len(reset_pin_input) <= 6 and reset_pin_input.isdigit()):
+                    st.error("PIN must be 4 to 6 digits")
+                elif reset_pin(int(recovery_account_id), recovery_email_input, reset_code, reset_pin_input):
+                    st.success("PIN changed. You can now log in with your account ID and new PIN.")
+                else:
+                    st.error("Invalid or expired reset code")
+            if st.button("❌ Cancel recovery"):
+                st.session_state.show_forgot_pin = False
+                st.rerun()
     
     with tab2:
         st.markdown("### Create a new PIN")
@@ -1222,7 +1231,9 @@ def show_pin_login():
                         st.session_state.user_id = user_id
                         st.session_state.expenses = []
                         st.session_state.custom_categories = {}
-                        st.success("✅ PIN created successfully!")
+                        st.session_state.selected_for_deletion = set()
+                        st.session_state.duplicate_generation = st.session_state.get('duplicate_generation', 0) + 1
+                        st.session_state.created_account_id = user_id
                         st.rerun()
                     else:
                         st.error("❌ Failed to create PIN. Try a different PIN.")
@@ -1286,6 +1297,10 @@ def main():
         st.session_state.auth_mode = None
     if 'user_id' not in st.session_state:
         st.session_state.user_id = None
+
+    if st.session_state.auth_mode in ("pin_login", "authenticated") and get_engine() is not None and not st.session_state.get('db_initialized', False):
+        init_db()
+        st.session_state.db_initialized = True
     
     # Show appropriate screen based on auth state
     if st.session_state.auth_mode is None:
@@ -1298,10 +1313,6 @@ def main():
         show_account_login()
         return
     
-    # Initialize database on first run
-    if get_engine() is not None:
-        init_db()
-    
     # For authenticated users or guests, load data
     if st.session_state.auth_mode == "guest":
         load_data()  # Load session-only data
@@ -1311,6 +1322,10 @@ def main():
     col1, col2 = st.columns([3, 1])
     with col1:
         st.title("💰 Expense Tracker")
+        if st.session_state.auth_mode == "authenticated":
+            st.caption(f"Account ID: {st.session_state.user_id}")
+            if st.session_state.pop('created_account_id', None):
+                st.info("Save your Account ID. You need it along with your PIN to log in.")
     with col2:
         if st.session_state.auth_mode == "authenticated":
             if st.button("🚪 Logout", use_container_width=True):
@@ -1318,6 +1333,8 @@ def main():
                 for key in ['auth_mode', 'user_id', 'expenses', 'custom_categories']:
                     if key in st.session_state:
                         del st.session_state[key]
+                st.session_state.selected_for_deletion = set()
+                st.session_state.duplicate_generation = st.session_state.get('duplicate_generation', 0) + 1
                 st.rerun()
         elif st.session_state.auth_mode == "guest":
             if st.button("🔑 Login", use_container_width=True):
@@ -1355,7 +1372,10 @@ def main():
     
     # Auto-save indicator
     if st.session_state.expenses:
-        st.caption(f"💾 {len(st.session_state.expenses)} expenses saved")
+        if st.session_state.auth_mode == "authenticated":
+            st.caption(f"💾 {len(st.session_state.expenses)} expenses saved")
+        else:
+            st.caption(f"{len(st.session_state.expenses)} expenses in this session")
 
 if __name__ == "__main__":
     main()

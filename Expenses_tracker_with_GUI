@@ -172,6 +172,10 @@ def cc():
         messagebox.showerror("Error", "Invalid selection. Please choose again.", parent=root)
 
 def vs():
+    if not expenses:
+        messagebox.showinfo("Summary", "No expenses recorded yet.", parent=root)
+        return
+
     total_expense = sum(expense['amount'] for expense in expenses)
     summary = f"Total Expenses: ₹{total_expense:.2f}\n\n"
 
@@ -495,6 +499,7 @@ def show_main_window():
     
     root = tk.Tk()
     root.title("Expense Tracker")
+    root.protocol("WM_DELETE_WINDOW", on_exit)
     root.geometry(f"{WINDOW_WIDTH}x{WINDOW_HEIGHT}")
     root.configure(bg=BG_COLOR)
     root.resizable(False, False)
@@ -525,15 +530,15 @@ def show_main_window():
     create_styled_button(content_frame, "📊 View Summary", lambda: vs(), 1, pady=12)
     create_styled_button(content_frame, "📅 View Expenses by Period", lambda: vep(), 2, pady=12)
     create_styled_button(content_frame, "📁 Manage Categories", lambda: manage_categories(), 3, pady=12)
-    create_styled_button(content_frame, "💾 Save and Exit", lambda: on_exit(), 4, pady=12)
+    create_styled_button(content_frame, "💾 Save and Exit", lambda: on_exit(export=True), 4, pady=12)
     
     root.mainloop()
 
-def on_exit():
-    """Handle exit button click"""
+def on_exit(export=False):
+    """Save on either exit path; export when the button requests it."""
     se()
-    ete()
-    root.quit()
+    if export:
+        ete()
     root.destroy()
 
 if __name__ == "__main__":

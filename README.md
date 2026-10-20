@@ -13,7 +13,7 @@ A comprehensive expense tracking application with both **desktop GUI** and **web
 - **📊 View Summary** - Get insights with category-wise breakdowns and statistics
 - **📅 Filter by Period** - View expenses by daily, weekly, or monthly periods
 - **📁 Custom Categories** - Create and manage your own expense categories
-- **💾 Data Persistence** - Auto-save to JSON file
+- **💾 Data Persistence** - Desktop data is saved to JSON when the window closes; authenticated web data is stored in PostgreSQL
 - **📥 Export to Excel** - Download your expense data as Excel files
 
 ### Smart Date Input
@@ -71,7 +71,7 @@ streamlit run app.py
 3. Click **Connect** → select **SQLAlchemy** → copy the connection string  
    `postgresql://USER:PASSWORD@HOST/neondb?sslmode=require`
 4. For local dev, place this string in `.env` as shown above (the app loads it via `python-dotenv`)
-5. Without `DATABASE_URL`, the app falls back to local `expenses.json`
+5. Without `DATABASE_URL`, the web app offers guest mode with session-only data. PIN accounts require PostgreSQL. The desktop app uses `expenses.json`.
 
 ### Deploy to Streamlit Community Cloud (free)
 
@@ -106,6 +106,10 @@ streamlit run app.py
 2. Choose a category (or add a custom one)
 3. Enter amount, description, and date
 4. Click "Add Expense"
+
+### PIN accounts on the web
+
+Create a PIN account with `DATABASE_URL` configured, then save the Account ID shown after creation. Login requires both the Account ID and PIN. A recovery email is optional; if provided, it can receive your Account ID and a 15-minute PIN reset code. Email recovery requires `GMAIL_USER` and `GMAIL_APP_PASSWORD` to be configured. Accounts without a recovery email need their Account ID to be supplied by the database administrator if it is lost.
 
 ### Viewing Summary
 - See total expenses across all categories
