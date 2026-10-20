@@ -185,6 +185,21 @@ class UiRegressionTests(unittest.TestCase):
         desktop["on_exit"](export=True)
         self.assertEqual(events, ["save", "export", "destroy"])
 
+    def test_desktop_save_failure_keeps_window_open_and_reports_error(self):
+        events = []
+        def fail_save():
+            raise OSError("disk full")
+        desktop = {
+            "se": fail_save,
+            "ete": lambda: events.append("export"),
+            "root": SimpleNamespace(destroy=lambda: events.append("destroy")),
+            "messagebox": SimpleNamespace(showerror=lambda *args, **kwargs: events.append(args)),
+        }
+        load_functions(ROOT / "Expenses_tracker_with_GUI", {"on_exit"}, desktop)
+        desktop["on_exit"](export=True)
+        self.assertEqual(len(events), 1)
+        self.assertIn("disk full", events[0][1])
+
     def test_desktop_rejects_nonpositive_and_nonfinite_amounts(self):
         for amount in ("0", "-5", "nan", "inf"):
             with self.subTest(amount=amount):
@@ -385,6 +400,27 @@ class UiRegressionTests(unittest.TestCase):
         with self.assertRaises(Rerun):
             app["main"]()
         self.assertEqual(cleared, [True])
+
+    def test_guest_expenses_return_after_authenticated_logout(self):
+        fake = FakeStreamlit()
+        fake.clicked = {"🔑 Login"}
+        fake.session_state.expenses = [{"amount": 12, "category": "groceries"}]
+        fake.session_state.custom_categories = {"food": 0}
+        app = {"st": fake, "load_data": lambda: None}
+        load_functions(ROOT / "app.py", {"main", "clear_authenticated_session",
+                                         "invalidate_duplicate_selection"}, app)
+        with self.assertRaises(Rerun):
+            app["main"]()
+        self.assertEqual(fake.session_state.saved_guest_expenses, [{"amount": 12, "category": "groceries"}])
+
+        fake.session_state.auth_mode = "authenticated"
+        fake.session_state.user_id = 17
+        fake.session_state.expenses = [{"amount": 99, "category": "utilities"}]
+        fake.session_state.custom_categories = {"other": 0}
+        app["clear_authenticated_session"]()
+        self.assertEqual(fake.session_state.expenses, [{"amount": 12, "category": "groceries"}])
+        self.assertEqual(fake.session_state.custom_categories, {"food": 0})
+        self.assertNotIn("saved_guest_expenses", fake.session_state)
 
 
 if __name__ == "__main__":

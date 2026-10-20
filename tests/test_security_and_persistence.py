@@ -16,9 +16,9 @@ FUNCTIONS = {
     "authenticate_pin", "request_pin_reset", "reset_pin",
     "update_user_expense", "delete_user_expenses", "rename_user_category",
     "remove_user_category", "save_user_expense", "get_user_data",
-    "hash_password", "verify_password", "create_account_user", "authenticate_account",
+    "hash_pin", "hash_password", "verify_password", "create_account_user", "authenticate_account",
     "request_password_reset", "reset_account_password",
-    "get_user_auth_version",
+    "get_user_auth_version", "send_account_ids_by_email", "create_pin_user",
 }
 tree = ast.parse(SOURCE.read_text())
 module = ast.Module(body=[node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in FUNCTIONS], type_ignores=[])
@@ -39,6 +39,15 @@ class Result:
         return self.value
 
     def scalar_one(self):
+        return self.value
+
+    def fetchone(self):
+        return (self.value,)
+
+    def scalars(self):
+        return self
+
+    def all(self):
         return self.value
 
     def __iter__(self):
@@ -89,10 +98,33 @@ class SecurityAndPersistenceTests(unittest.TestCase):
         self.engine = FakeEngine([Result(SimpleNamespace(token_valid=True, pin_reset_token_hash=token_hash)), Result()])
         scope["hash_pin"] = lambda pin: "hashed:" + pin
         self.assertTrue(scope["reset_pin"](7, "person@example.com", code, "123456"))
-        self.assertIn("WHERE id = :id AND recovery_email = :email", self.engine.calls[0][0])
+        self.assertIn("WHERE id = :id AND LOWER(TRIM(recovery_email)) = :email", self.engine.calls[0][0])
         self.assertIn("pin_reset_token_hash = NULL", self.engine.calls[1][0])
         self.assertIn("auth_version = auth_version + 1", self.engine.calls[1][0])
         self.assertEqual(self.engine.calls[1][1]["pin_hash"], "hashed:123456")
+
+    def test_pin_recovery_email_is_case_and_whitespace_insensitive(self):
+        self.engine = FakeEngine([Result(7)])
+        self.assertEqual(scope["create_pin_user"]("1234", " Person@Example.COM "), 7)
+        self.assertEqual(self.engine.calls[0][1]["recovery_email"], "person@example.com")
+
+        self.engine = FakeEngine([Result([7])])
+        sent = []
+        scope["send_recovery_email"] = lambda email, *args: sent.append(email) or (True, "sent")
+        self.assertTrue(scope["send_account_ids_by_email"](" PERSON@example.com "))
+        self.assertEqual(self.engine.calls[0][1]["email"], "person@example.com")
+        self.assertIn("LOWER(TRIM(recovery_email)) = :email", self.engine.calls[0][0])
+        self.assertEqual(sent, ["person@example.com"])
+
+        self.engine = FakeEngine([Result(7), Result()])
+        self.assertTrue(scope["request_pin_reset"](7, " PERSON@example.com "))
+        self.assertEqual(self.engine.calls[0][1]["email"], "person@example.com")
+
+        code = "case-insensitive-code"
+        token_hash = hashlib.sha256(code.encode()).hexdigest()
+        self.engine = FakeEngine([Result(SimpleNamespace(token_valid=True, pin_reset_token_hash=token_hash)), Result()])
+        self.assertTrue(scope["reset_pin"](7, " PERSON@example.com ", code, "1234"))
+        self.assertEqual(self.engine.calls[0][1]["email"], "person@example.com")
 
     def test_expense_mutations_require_user_and_expense_ids(self):
         self.engine = FakeEngine([Result(rowcount=1), Result(rowcount=1)])

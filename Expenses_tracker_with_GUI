@@ -572,7 +572,11 @@ def show_main_window():
 
 def on_exit(export=False):
     """Save on either exit path; export when the button requests it."""
-    se()
+    try:
+        se()
+    except (OSError, TypeError, ValueError) as error:
+        messagebox.showerror("Save failed", f"Expenses were not saved: {error}", parent=root)
+        return
     if export:
         ete()
     root.destroy()

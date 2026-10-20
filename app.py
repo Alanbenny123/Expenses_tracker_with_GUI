@@ -282,6 +282,7 @@ def create_pin_user(pin, recovery_email=None):
         return None
     
     pin_hash = hash_pin(pin)
+    recovery_email = (recovery_email.strip().lower() or None) if recovery_email else None
     
     try:
         with engine.begin() as conn:
@@ -502,11 +503,12 @@ def send_account_ids_by_email(email):
     engine = get_engine()
     if engine is None:
         return False
+    email = email.strip().lower()
     try:
         with engine.begin() as conn:
             ids = conn.execute(text("""
                 SELECT id FROM users
-                WHERE recovery_email = :email AND user_type = 'pin'
+                WHERE LOWER(TRIM(recovery_email)) = :email AND user_type = 'pin'
             """), {"email": email}).scalars().all()
         if not ids:
             return True
@@ -521,10 +523,11 @@ def request_pin_reset(account_id, email):
     engine = get_engine()
     if engine is None:
         return False
+    email = email.strip().lower()
     try:
         with engine.begin() as conn:
             found = conn.execute(text("""
-                SELECT id FROM users WHERE id = :id AND recovery_email = :email
+                SELECT id FROM users WHERE id = :id AND LOWER(TRIM(recovery_email)) = :email
                     AND user_type = 'pin'
             """), {"id": account_id, "email": email}).scalar_one_or_none()
             if found is None:
@@ -553,6 +556,7 @@ def request_pin_reset(account_id, email):
 
 def reset_pin(account_id, email, code, new_pin):
     """Consume a valid reset code and set a new PIN atomically."""
+    email = email.strip().lower()
     engine = get_engine()
     if engine is None:
         return False
@@ -561,7 +565,7 @@ def reset_pin(account_id, email, code, new_pin):
             row = conn.execute(text("""
                 SELECT pin_reset_token_hash,
                     pin_reset_expires_at > CURRENT_TIMESTAMP AS token_valid
-                FROM users WHERE id = :id AND recovery_email = :email
+                FROM users WHERE id = :id AND LOWER(TRIM(recovery_email)) = :email
                     AND user_type = 'pin' FOR UPDATE
             """), {"id": account_id, "email": email}).one_or_none()
             if row is None or not row.token_valid or not row.pin_reset_token_hash:
@@ -669,6 +673,11 @@ def start_authenticated_session(user_id):
 def clear_authenticated_session():
     for key in ('auth_mode', 'user_id', 'auth_version', 'expenses', 'custom_categories'):
         st.session_state.pop(key, None)
+    guest_expenses = st.session_state.pop('saved_guest_expenses', None)
+    guest_categories = st.session_state.pop('saved_guest_categories', None)
+    if guest_expenses is not None:
+        st.session_state.expenses = guest_expenses
+        st.session_state.custom_categories = guest_categories or {}
     st.session_state.pop('pending_duplicate', None)
     invalidate_duplicate_selection()
 
@@ -1550,6 +1559,8 @@ def main():
                 st.rerun()
         elif st.session_state.auth_mode == "guest":
             if st.button("🔑 Login", use_container_width=True):
+                st.session_state.saved_guest_expenses = [expense.copy() for expense in st.session_state.expenses]
+                st.session_state.saved_guest_categories = st.session_state.custom_categories.copy()
                 st.session_state.auth_mode = None
                 st.rerun()
     st.divider()
