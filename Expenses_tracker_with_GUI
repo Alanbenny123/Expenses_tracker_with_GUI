@@ -1,5 +1,6 @@
 
 import json
+import math
 import os
 from datetime import datetime, timedelta
 import pandas as pd
@@ -115,6 +116,9 @@ def am():
         amount = float(amount_str)
     except ValueError:
         messagebox.showerror("Error", "Invalid format.", parent=root)
+        return
+    if not math.isfinite(amount) or amount <= 0:
+        messagebox.showerror("Error", "Amount must be a finite number greater than zero.", parent=root)
         return
 
     description = ask_string_input("Add Expense", "Enter a brief description:", root)
@@ -309,7 +313,9 @@ def manage_categories():
             if category_input is None:
                 continue
             category_name = category_input.strip().lower()
-            if category_name in categories or category_name in custom_categories:
+            if not category_name:
+                messagebox.showerror("Error", "Category name cannot be empty.", parent=root)
+            elif category_name in categories or category_name in custom_categories:
                 messagebox.showerror("Error", "Category already exists.", parent=root)
             else:
                 custom_categories[category_name] = 0
@@ -324,6 +330,9 @@ def manage_categories():
             choice_num = ask_integer_input("Edit Category", prompt, root)
             if choice_num is None:
                 continue
+            if not 1 <= choice_num <= len(category_list):
+                messagebox.showerror("Error", "Invalid selection.", parent=root)
+                continue
             index = choice_num - 1
             try:
                 category_name = category_list[index]
@@ -331,7 +340,9 @@ def manage_categories():
                 if new_name_input is None:
                     continue
                 new_name = new_name_input.strip().lower()
-                if new_name in categories or new_name in custom_categories:
+                if not new_name:
+                    messagebox.showerror("Error", "Category name cannot be empty.", parent=root)
+                elif new_name in categories or new_name in custom_categories:
                     messagebox.showerror("Error", "Category name already exists.", parent=root)
                 else:
                     custom_categories[new_name] = custom_categories.pop(category_name)
@@ -347,6 +358,9 @@ def manage_categories():
             prompt = "\n".join([f"{idx + 1}. {category.capitalize()}" for idx, category in enumerate(category_list)])
             choice_num = ask_integer_input("Remove Category", prompt, root)
             if choice_num is None:
+                continue
+            if not 1 <= choice_num <= len(category_list):
+                messagebox.showerror("Error", "Invalid selection.", parent=root)
                 continue
             index = choice_num - 1
             try:

@@ -16,11 +16,13 @@ FUNCTIONS = {
     "authenticate_pin", "request_pin_reset", "reset_pin",
     "update_user_expense", "delete_user_expenses", "rename_user_category",
     "remove_user_category", "save_user_expense", "get_user_data",
+    "hash_password", "verify_password", "create_account_user", "authenticate_account",
 }
 tree = ast.parse(SOURCE.read_text())
 module = ast.Module(body=[node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in FUNCTIONS], type_ignores=[])
 scope = {"text": lambda sql: sql, "hashlib": hashlib, "secrets": secrets, "compare_digest": compare_digest}
 exec(compile(module, str(SOURCE), "exec"), scope)
+ORIGINAL_FUNCTIONS = {name: scope[name] for name in FUNCTIONS}
 
 
 class Result:
@@ -57,6 +59,7 @@ class FakeEngine:
 
 class SecurityAndPersistenceTests(unittest.TestCase):
     def setUp(self):
+        scope.update(ORIGINAL_FUNCTIONS)
         self.engine = FakeEngine([])
         scope["get_engine"] = lambda: self.engine
         scope["st"] = SimpleNamespace(error=lambda message: self.fail(message))
@@ -116,6 +119,33 @@ class SecurityAndPersistenceTests(unittest.TestCase):
         self.assertTrue(scope["remove_user_category"](7, "new"))
         self.assertEqual(len(self.engine.calls), 3)
         self.assertTrue(all("user_id = :user_id" in sql for sql, _ in self.engine.calls))
+
+    def test_account_registration_hashes_password_and_normalizes_email(self):
+        self.engine = FakeEngine([Result(17)])
+        self.assertEqual(scope["create_account_user"](" Person@Example.COM ", "long-password"), 17)
+        params = self.engine.calls[0][1]
+        self.assertEqual(params["email"], "person@example.com")
+        self.assertNotEqual(params["password_hash"], "long-password")
+        self.assertTrue(scope["verify_password"]("long-password", params["password_hash"]))
+        self.assertFalse(scope["verify_password"]("wrong-password", params["password_hash"]))
+
+    def test_account_login_is_email_scoped_and_locks_after_five_failures(self):
+        password_hash = scope["hash_password"]("long-password")
+        row = SimpleNamespace(id=17, password_hash=password_hash, failed_attempts=4,
+                              is_locked=False, lock_expired=False)
+        self.engine = FakeEngine([Result(row), Result()])
+        self.assertIsNone(scope["authenticate_account"]("PERSON@EXAMPLE.COM", "wrong-password"))
+        self.assertIn("email = :email AND user_type = 'account'", self.engine.calls[0][0])
+        self.assertEqual(self.engine.calls[0][1]["email"], "person@example.com")
+        self.assertEqual(self.engine.calls[1][1]["attempts"], 5)
+
+    def test_account_login_accepts_correct_password(self):
+        password_hash = scope["hash_password"]("long-password")
+        row = SimpleNamespace(id=17, password_hash=password_hash, failed_attempts=2,
+                              is_locked=False, lock_expired=False)
+        self.engine = FakeEngine([Result(row), Result()])
+        self.assertEqual(scope["authenticate_account"]("person@example.com", "long-password"), 17)
+        self.assertIn("failed_attempts = 0", self.engine.calls[1][0])
 
 
 if __name__ == "__main__":

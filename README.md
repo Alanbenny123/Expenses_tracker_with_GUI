@@ -111,6 +111,10 @@ streamlit run app.py
 
 Create a PIN account with `DATABASE_URL` configured, then save the Account ID shown after creation. Login requires both the Account ID and PIN. A recovery email is optional; if provided, it can receive your Account ID and a 15-minute PIN reset code. Email recovery requires `GMAIL_USER` and `GMAIL_APP_PASSWORD` to be configured. Accounts without a recovery email need their Account ID to be supplied by the database administrator if it is lost.
 
+### Email/password accounts on the web
+
+With `DATABASE_URL` configured, Account Mode supports registration and login using an email address and a password of at least eight characters. Passwords are stored as salted hashes. Five failed sign-in attempts lock an account for 15 minutes. Password recovery is not available yet, so keep your password safe.
+
 ### Viewing Summary
 - See total expenses across all categories
 - View average spending per category
@@ -164,8 +168,8 @@ The app intelligently parses various date formats:
 
 ## 🔮 Future Enhancements
 
-- [ ] Database integration (SQLite/PostgreSQL)
-- [ ] User authentication and multi-user support
+- [ ] Persistent guest storage or SQLite support
+- [ ] Password recovery and email verification for account mode
 - [ ] Budget setting and tracking
 - [ ] Expense reports and analytics
 - [ ] Mobile app version

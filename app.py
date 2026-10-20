@@ -198,6 +198,76 @@ def verify_pin(pin, stored_hash):
     except:
         return False
 
+def hash_password(password):
+    """Store account passwords with a salted PBKDF2 hash."""
+    salt = secrets.token_hex(16)
+    iterations = 310000
+    password_hash = hashlib.pbkdf2_hmac('sha256', password.encode(), salt.encode(), iterations)
+    return f"pbkdf2_sha256${iterations}${salt}${password_hash.hex()}"
+
+def verify_password(password, stored_hash):
+    try:
+        algorithm, iterations, salt, hash_hex = stored_hash.split('$')
+        if algorithm != 'pbkdf2_sha256':
+            return False
+        candidate = hashlib.pbkdf2_hmac('sha256', password.encode(), salt.encode(), int(iterations))
+        return compare_digest(candidate.hex(), hash_hex)
+    except (AttributeError, TypeError, ValueError):
+        return False
+
+def create_account_user(email, password):
+    """Create an email/password account in PostgreSQL."""
+    engine = get_engine()
+    if engine is None:
+        return None
+    try:
+        with engine.begin() as conn:
+            return conn.execute(text("""
+                INSERT INTO users (user_type, email, password_hash, last_login)
+                VALUES ('account', :email, :password_hash, CURRENT_TIMESTAMP)
+                RETURNING id
+            """), {
+                "email": email.strip().lower(),
+                "password_hash": hash_password(password),
+            }).scalar_one()
+    except Exception:
+        return None
+
+def authenticate_account(email, password):
+    """Check an account password with a database-backed attempt limit."""
+    engine = get_engine()
+    if engine is None:
+        return None
+    try:
+        with engine.begin() as conn:
+            row = conn.execute(text("""
+                SELECT id, password_hash, failed_attempts,
+                    locked_until IS NOT NULL AND locked_until > CURRENT_TIMESTAMP AS is_locked,
+                    locked_until IS NOT NULL AND locked_until <= CURRENT_TIMESTAMP AS lock_expired
+                FROM users WHERE email = :email AND user_type = 'account'
+                FOR UPDATE
+            """), {"email": email.strip().lower()}).one_or_none()
+            if row is None or row.is_locked:
+                return None
+            if verify_password(password, row.password_hash):
+                conn.execute(text("""
+                    UPDATE users SET last_login = CURRENT_TIMESTAMP,
+                        failed_attempts = 0, locked_until = NULL
+                    WHERE id = :user_id
+                """), {"user_id": row.id})
+                return row.id
+            attempts = 1 if row.lock_expired else row.failed_attempts + 1
+            conn.execute(text("""
+                UPDATE users SET failed_attempts = :attempts,
+                    locked_until = CASE WHEN :attempts >= 5
+                        THEN CURRENT_TIMESTAMP + INTERVAL '15 minutes'
+                        ELSE locked_until END
+                WHERE id = :user_id
+            """), {"user_id": row.id, "attempts": attempts})
+        return None
+    except Exception:
+        return None
+
 def create_pin_user(pin, recovery_email=None):
     """Create new PIN user"""
     engine = get_engine()
@@ -499,6 +569,15 @@ def get_all_categories():
 def invalidate_duplicate_selection():
     st.session_state.selected_for_deletion = set()
     st.session_state.duplicate_generation = st.session_state.get('duplicate_generation', 0) + 1
+
+def start_authenticated_session(user_id):
+    expenses, custom_categories = get_user_data(user_id)
+    st.session_state.auth_mode = "authenticated"
+    st.session_state.user_id = user_id
+    st.session_state.expenses = expenses
+    st.session_state.custom_categories = custom_categories
+    st.session_state.pop('pending_duplicate', None)
+    invalidate_duplicate_selection()
 
 def record_expense(expense):
     """Persist an expense before adding it to the visible session."""
@@ -1105,9 +1184,9 @@ def show_login_screen():
     
     with col3:
         st.markdown("#### 🔒 Account Mode")
-        st.markdown("- Full email/password")
-        st.markdown("- Maximum security")
-        st.markdown("- Advanced features")
+        st.markdown("- Email and password login")
+        st.markdown("- Persistent expenses and categories")
+        st.markdown("- Requires database storage")
         if st.button("🔒 Create Account", use_container_width=True):
             st.session_state.auth_mode = "account_login"
             st.rerun()
@@ -1145,14 +1224,7 @@ def show_pin_login():
                 else:
                     user_id = authenticate_pin(int(account_id_input), pin)
                     if user_id:
-                        st.session_state.auth_mode = "authenticated"
-                        st.session_state.user_id = user_id
-                        st.session_state.selected_for_deletion = set()
-                        st.session_state.duplicate_generation = st.session_state.get('duplicate_generation', 0) + 1
-                        # Load user data
-                        expenses, custom_categories = get_user_data(user_id)
-                        st.session_state.expenses = expenses
-                        st.session_state.custom_categories = custom_categories
+                        start_authenticated_session(user_id)
                         st.success("✅ Login successful!")
                         st.rerun()
                     else:
@@ -1227,12 +1299,7 @@ def show_pin_login():
                 else:
                     user_id = create_pin_user(new_pin, recovery_email if recovery_email else None)
                     if user_id:
-                        st.session_state.auth_mode = "authenticated"
-                        st.session_state.user_id = user_id
-                        st.session_state.expenses = []
-                        st.session_state.custom_categories = {}
-                        st.session_state.selected_for_deletion = set()
-                        st.session_state.duplicate_generation = st.session_state.get('duplicate_generation', 0) + 1
+                        start_authenticated_session(user_id)
                         st.session_state.created_account_id = user_id
                         st.rerun()
                     else:
@@ -1247,6 +1314,10 @@ def show_account_login():
         if st.button("🏠 Main Menu", use_container_width=True):
             st.session_state.auth_mode = None
             st.rerun()
+
+    if get_engine() is None:
+        st.warning("Email/password accounts require DATABASE_URL. Guest mode is available without a database.")
+        return
     
     tab1, tab2 = st.tabs(["🔑 Login", "➕ Create Account"])
     
@@ -1261,8 +1332,13 @@ def show_account_login():
                 if not email or not password:
                     st.error("Please enter both email and password")
                 else:
-                    # TODO: Implement account authentication
-                    st.error("Account authentication not yet implemented")
+                    user_id = authenticate_account(email, password)
+                    if user_id:
+                        start_authenticated_session(user_id)
+                        st.success("✅ Login successful!")
+                        st.rerun()
+                    else:
+                        st.error("Invalid email or password, or account temporarily locked")
         
         with col2:
             if st.button("🔓 Back to Guest", use_container_width=True):
@@ -1279,16 +1355,20 @@ def show_account_login():
         if st.button("➕ Create Account", type="primary", use_container_width=True):
             if not new_email or not new_password:
                 st.error("Please fill in all fields")
-            elif not re.match(r'^[^@]+@[^@]+\.[^@]+$', new_email):
+            elif not re.fullmatch(r'[^@\s]+@[^@\s]+\.[^@\s]+', new_email.strip()):
                 st.error("Invalid email format")
-            elif len(new_password) < 6:
-                st.error("Password must be at least 6 characters")
+            elif len(new_password) < 8:
+                st.error("Password must be at least 8 characters")
             elif new_password != confirm_password:
                 st.error("Passwords don't match")
             else:
-                # TODO: Implement account creation
-                st.error("Account creation not yet implemented")
-                st.info("💡 Try PIN Mode instead - it's fully functional!")
+                user_id = create_account_user(new_email, new_password)
+                if user_id:
+                    start_authenticated_session(user_id)
+                    st.success("✅ Account created successfully!")
+                    st.rerun()
+                else:
+                    st.error("Could not create the account. The email may already be registered.")
 
 # Main app
 def main():
@@ -1298,7 +1378,7 @@ def main():
     if 'user_id' not in st.session_state:
         st.session_state.user_id = None
 
-    if st.session_state.auth_mode in ("pin_login", "authenticated") and get_engine() is not None and not st.session_state.get('db_initialized', False):
+    if st.session_state.auth_mode in ("pin_login", "account_login", "authenticated") and get_engine() is not None and not st.session_state.get('db_initialized', False):
         init_db()
         st.session_state.db_initialized = True
     
