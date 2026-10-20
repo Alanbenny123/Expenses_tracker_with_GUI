@@ -1,8 +1,11 @@
 """Exercise UI decisions without requiring Streamlit or a display server."""
 
 import ast
+import json
 import math
+import os
 import re
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -74,6 +77,8 @@ class FakeStreamlit:
         raise Rerun()
 
     def __getattr__(self, name):
+        if name == "divider":
+            return lambda: None
         if name in {"subheader", "warning", "write", "success", "error", "info", "title", "markdown"}:
             return lambda message: self.messages.append((name, message))
         raise AttributeError(name)
@@ -200,6 +205,83 @@ class UiRegressionTests(unittest.TestCase):
                 with self.assertRaises(Rerun):
                     account["show_account_login"]()
                 self.assertEqual(sessions, [17])
+
+    def test_account_password_recovery_uses_email_code(self):
+        fake = FakeAccountStreamlit()
+        requests = []
+        resets = []
+        account = {
+            "st": fake, "re": re, "get_engine": lambda: object(),
+            "request_password_reset": lambda email: requests.append(email),
+            "reset_account_password": lambda email, code, password: resets.append((email, code, password)) or True,
+        }
+        load_functions(ROOT / "app.py", {"show_account_login"}, account)
+        fake.clicked = {"Forgot password?"}
+        with self.assertRaises(Rerun):
+            account["show_account_login"]()
+        fake.inputs = {
+            "password_reset_email": "person@example.com",
+            "password_reset_code": "email-code",
+            "reset_account_password": "new-password",
+            "confirm_reset_account_password": "new-password",
+        }
+        fake.clicked = {"Email password reset code"}
+        account["show_account_login"]()
+        self.assertEqual(requests, ["person@example.com"])
+        fake.clicked = {"Set new password"}
+        account["show_account_login"]()
+        self.assertEqual(resets, [("person@example.com", "email-code", "new-password")])
+        self.assertFalse(fake.session_state.show_forgot_password)
+
+    def test_desktop_data_path_is_stable_across_working_directories(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            app_dir = os.path.join(temp_dir, "app")
+            old_dir = os.path.join(temp_dir, "old")
+            other_dir = os.path.join(temp_dir, "other")
+            for path in (app_dir, old_dir, other_dir):
+                os.mkdir(path)
+            data_file = os.path.join(app_dir, "expenses.json")
+            with open(os.path.join(old_dir, "expenses.json"), "w", encoding="utf-8") as file:
+                json.dump({"expenses": [{"amount": 12}], "custom_categories": {"food": 0}}, file)
+            desktop = {"os": os, "json": json, "DATA_FILE": data_file,
+                       "expenses": [], "custom_categories": {}}
+            load_functions(ROOT / "Expenses_tracker_with_GUI", {"le", "se"}, desktop)
+            previous_dir = os.getcwd()
+            try:
+                os.chdir(old_dir)
+                desktop["le"]()
+                self.assertEqual(desktop["expenses"], [{"amount": 12}])
+                desktop["se"]()
+                self.assertTrue(os.path.isfile(data_file))
+                desktop["expenses"] = []
+                os.chdir(other_dir)
+                desktop["le"]()
+                self.assertEqual(desktop["expenses"], [{"amount": 12}])
+            finally:
+                os.chdir(previous_dir)
+
+    def test_devcontainer_keeps_streamlit_browser_protections(self):
+        config = (ROOT / ".devcontainer" / "devcontainer.json").read_text()
+        self.assertIn('"server": "streamlit run app.py"', config)
+        self.assertNotIn("--server.enableCORS false", config)
+        self.assertNotIn("--server.enableXsrfProtection false", config)
+
+    def test_reset_credentials_invalidates_existing_session(self):
+        fake = FakeStreamlit()
+        fake.session_state.auth_mode = "authenticated"
+        fake.session_state.user_id = 17
+        fake.session_state.auth_version = 0
+        fake.session_state.db_initialized = True
+        cleared = []
+        app = {
+            "st": fake, "get_engine": lambda: object(),
+            "get_user_auth_version": lambda user_id: 1,
+            "clear_authenticated_session": lambda: cleared.append(True),
+        }
+        load_functions(ROOT / "app.py", {"main"}, app)
+        with self.assertRaises(Rerun):
+            app["main"]()
+        self.assertEqual(cleared, [True])
 
 
 if __name__ == "__main__":

@@ -17,6 +17,8 @@ FUNCTIONS = {
     "update_user_expense", "delete_user_expenses", "rename_user_category",
     "remove_user_category", "save_user_expense", "get_user_data",
     "hash_password", "verify_password", "create_account_user", "authenticate_account",
+    "request_password_reset", "reset_account_password",
+    "get_user_auth_version",
 }
 tree = ast.parse(SOURCE.read_text())
 module = ast.Module(body=[node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in FUNCTIONS], type_ignores=[])
@@ -89,6 +91,7 @@ class SecurityAndPersistenceTests(unittest.TestCase):
         self.assertTrue(scope["reset_pin"](7, "person@example.com", code, "123456"))
         self.assertIn("WHERE id = :id AND recovery_email = :email", self.engine.calls[0][0])
         self.assertIn("pin_reset_token_hash = NULL", self.engine.calls[1][0])
+        self.assertIn("auth_version = auth_version + 1", self.engine.calls[1][0])
         self.assertEqual(self.engine.calls[1][1]["pin_hash"], "hashed:123456")
 
     def test_expense_mutations_require_user_and_expense_ids(self):
@@ -146,6 +149,48 @@ class SecurityAndPersistenceTests(unittest.TestCase):
         self.engine = FakeEngine([Result(row), Result()])
         self.assertEqual(scope["authenticate_account"]("person@example.com", "long-password"), 17)
         self.assertIn("failed_attempts = 0", self.engine.calls[1][0])
+
+    def test_password_reset_request_does_not_change_password_when_email_fails(self):
+        self.engine = FakeEngine([Result(17), Result(), Result()])
+        scope["send_recovery_email"] = lambda *args: (False, "Email unavailable")
+        self.assertFalse(scope["request_password_reset"]("Person@Example.COM"))
+        self.assertEqual(self.engine.calls[0][1]["email"], "person@example.com")
+        self.assertTrue(all("password_hash =" not in sql for sql, _ in self.engine.calls))
+        self.assertIn("password_reset_token_hash = NULL", self.engine.calls[-1][0])
+
+    def test_password_reset_request_does_not_reveal_unknown_email(self):
+        self.engine = FakeEngine([Result(None)])
+        sent = []
+        scope["send_recovery_email"] = lambda *args: sent.append(args)
+        self.assertTrue(scope["request_password_reset"]("unknown@example.com"))
+        self.assertEqual(sent, [])
+        self.assertEqual(len(self.engine.calls), 1)
+
+    def test_password_reset_requires_valid_code_and_consumes_it(self):
+        code = "random-email-code"
+        code_hash = hashlib.sha256(code.encode()).hexdigest()
+        row = SimpleNamespace(id=17, password_reset_token_hash=code_hash, token_valid=True)
+        scope["hash_password"] = lambda password: "hashed:" + password
+        self.engine = FakeEngine([Result(row)])
+        self.assertFalse(scope["reset_account_password"]("person@example.com", "wrong", "new-password"))
+        self.assertEqual(len(self.engine.calls), 1)
+        self.engine = FakeEngine([Result(row), Result()])
+        self.assertTrue(scope["reset_account_password"]("PERSON@EXAMPLE.COM", code, "new-password"))
+        self.assertEqual(self.engine.calls[0][1]["email"], "person@example.com")
+        self.assertEqual(self.engine.calls[1][1]["password_hash"], "hashed:new-password")
+        self.assertIn("password_reset_token_hash = NULL", self.engine.calls[1][0])
+        self.assertIn("auth_version = auth_version + 1", self.engine.calls[1][0])
+
+    def test_expired_password_reset_code_cannot_change_password(self):
+        row = SimpleNamespace(id=17, password_reset_token_hash="stored", token_valid=False)
+        self.engine = FakeEngine([Result(row)])
+        self.assertFalse(scope["reset_account_password"]("person@example.com", "any-code", "new-password"))
+        self.assertEqual(len(self.engine.calls), 1)
+
+    def test_auth_version_is_loaded_for_session_revocation(self):
+        self.engine = FakeEngine([Result(3)])
+        self.assertEqual(scope["get_user_auth_version"](17), 3)
+        self.assertEqual(self.engine.calls[0][1]["user_id"], 17)
 
 
 if __name__ == "__main__":

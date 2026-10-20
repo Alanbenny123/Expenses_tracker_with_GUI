@@ -74,19 +74,25 @@ def init_db():
                 recovery_email VARCHAR(255),
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 last_login TIMESTAMP,
+                auth_version INTEGER NOT NULL DEFAULT 0,
                 failed_attempts INTEGER NOT NULL DEFAULT 0,
                 locked_until TIMESTAMP,
                 pin_reset_token_hash VARCHAR(64),
                 pin_reset_expires_at TIMESTAMP,
+                password_reset_token_hash VARCHAR(64),
+                password_reset_expires_at TIMESTAMP,
                 UNIQUE(pin_hash),
                 UNIQUE(email)
             );
         """))
         # Existing installations may have been created before these columns existed.
+        conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS auth_version INTEGER NOT NULL DEFAULT 0"))
         conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS failed_attempts INTEGER NOT NULL DEFAULT 0"))
         conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS locked_until TIMESTAMP"))
         conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS pin_reset_token_hash VARCHAR(64)"))
         conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS pin_reset_expires_at TIMESTAMP"))
+        conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS password_reset_token_hash VARCHAR(64)"))
+        conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS password_reset_expires_at TIMESTAMP"))
         
         # Create expenses table (now with user_id)
         conn.execute(text("""
@@ -362,6 +368,16 @@ def get_user_data(user_id):
         
         return expenses, custom_categories
 
+def get_user_auth_version(user_id):
+    """Read the version used to invalidate sessions after a credential reset."""
+    engine = get_engine()
+    if engine is None:
+        return None
+    with engine.begin() as conn:
+        return conn.execute(text("""
+            SELECT auth_version FROM users WHERE id = :user_id
+        """), {"user_id": user_id}).scalar_one_or_none()
+
 def save_user_expense(user_id, expense):
     """Save expense for specific user"""
     engine = get_engine()
@@ -555,9 +571,75 @@ def reset_pin(account_id, email, code, new_pin):
             conn.execute(text("""
                 UPDATE users SET pin_hash = :pin_hash,
                     pin_reset_token_hash = NULL, pin_reset_expires_at = NULL,
-                    failed_attempts = 0, locked_until = NULL
+                    failed_attempts = 0, locked_until = NULL,
+                    auth_version = auth_version + 1
                 WHERE id = :id
             """), {"id": account_id, "pin_hash": hash_pin(new_pin)})
+            return True
+    except Exception:
+        return False
+
+def request_password_reset(email):
+    """Email a short-lived reset code without changing the current password."""
+    engine = get_engine()
+    if engine is None:
+        return False
+    email = email.strip().lower()
+    try:
+        with engine.begin() as conn:
+            user_id = conn.execute(text("""
+                SELECT id FROM users WHERE email = :email AND user_type = 'account'
+            """), {"email": email}).scalar_one_or_none()
+            if user_id is None:
+                return True
+            code = secrets.token_urlsafe(24)
+            code_hash = hashlib.sha256(code.encode()).hexdigest()
+            conn.execute(text("""
+                UPDATE users SET password_reset_token_hash = :code_hash,
+                    password_reset_expires_at = CURRENT_TIMESTAMP + INTERVAL '15 minutes'
+                WHERE id = :user_id
+            """), {"user_id": user_id, "code_hash": code_hash})
+        sent, _ = send_recovery_email(
+            email, "Expense Tracker password reset code",
+            f"Your password reset code is: {code}\nThis code expires in 15 minutes."
+        )
+        if not sent:
+            with engine.begin() as conn:
+                conn.execute(text("""
+                    UPDATE users SET password_reset_token_hash = NULL,
+                        password_reset_expires_at = NULL
+                    WHERE id = :user_id AND password_reset_token_hash = :code_hash
+                """), {"user_id": user_id, "code_hash": code_hash})
+        return sent
+    except Exception:
+        return False
+
+def reset_account_password(email, code, new_password):
+    """Consume an emailed code and update the password atomically."""
+    if len(new_password) < 8 or not code:
+        return False
+    engine = get_engine()
+    if engine is None:
+        return False
+    try:
+        with engine.begin() as conn:
+            row = conn.execute(text("""
+                SELECT id, password_reset_token_hash,
+                    password_reset_expires_at > CURRENT_TIMESTAMP AS token_valid
+                FROM users WHERE email = :email AND user_type = 'account' FOR UPDATE
+            """), {"email": email.strip().lower()}).one_or_none()
+            if row is None or not row.token_valid or not row.password_reset_token_hash:
+                return False
+            code_hash = hashlib.sha256(code.encode()).hexdigest()
+            if not compare_digest(code_hash, row.password_reset_token_hash):
+                return False
+            conn.execute(text("""
+                UPDATE users SET password_hash = :password_hash,
+                    password_reset_token_hash = NULL, password_reset_expires_at = NULL,
+                    failed_attempts = 0, locked_until = NULL,
+                    auth_version = auth_version + 1
+                WHERE id = :user_id
+            """), {"user_id": row.id, "password_hash": hash_password(new_password)})
             return True
     except Exception:
         return False
@@ -572,10 +654,20 @@ def invalidate_duplicate_selection():
 
 def start_authenticated_session(user_id):
     expenses, custom_categories = get_user_data(user_id)
+    auth_version = get_user_auth_version(user_id)
+    if auth_version is None:
+        raise ValueError("Account no longer exists")
     st.session_state.auth_mode = "authenticated"
     st.session_state.user_id = user_id
+    st.session_state.auth_version = auth_version
     st.session_state.expenses = expenses
     st.session_state.custom_categories = custom_categories
+    st.session_state.pop('pending_duplicate', None)
+    invalidate_duplicate_selection()
+
+def clear_authenticated_session():
+    for key in ('auth_mode', 'user_id', 'auth_version', 'expenses', 'custom_categories'):
+        st.session_state.pop(key, None)
     st.session_state.pop('pending_duplicate', None)
     invalidate_duplicate_selection()
 
@@ -1235,7 +1327,7 @@ def show_pin_login():
                 st.session_state.auth_mode = "guest"
                 st.session_state.user_id = None
                 st.rerun()
-        
+
         st.divider()
         
         if st.button("🔑 Forgot PIN or Account ID?", use_container_width=True):
@@ -1345,6 +1437,38 @@ def show_account_login():
                 st.session_state.auth_mode = "guest"
                 st.session_state.user_id = None
                 st.rerun()
+
+        st.divider()
+        if st.button("Forgot password?"):
+            st.session_state.show_forgot_password = True
+            st.rerun()
+        if st.session_state.get('show_forgot_password', False):
+            st.markdown("### Reset your password")
+            reset_email = st.text_input("Account email", key="password_reset_email")
+            if st.button("Email password reset code"):
+                if not re.fullmatch(r'[^@\s]+@[^@\s]+\.[^@\s]+', reset_email.strip()):
+                    st.error("Enter a valid account email")
+                else:
+                    request_password_reset(reset_email)
+                    st.info("If this email is registered and email is configured, a reset code will arrive by email.")
+            reset_code = st.text_input("Reset code from email", key="password_reset_code")
+            new_password = st.text_input("New password", type="password", key="reset_account_password")
+            confirm_password = st.text_input("Confirm new password", type="password", key="confirm_reset_account_password")
+            if st.button("Set new password"):
+                if not re.fullmatch(r'[^@\s]+@[^@\s]+\.[^@\s]+', reset_email.strip()):
+                    st.error("Enter a valid account email")
+                elif len(new_password) < 8:
+                    st.error("Password must be at least 8 characters")
+                elif new_password != confirm_password:
+                    st.error("Passwords don't match")
+                elif reset_account_password(reset_email, reset_code, new_password):
+                    st.session_state.show_forgot_password = False
+                    st.success("Password changed. You can now sign in.")
+                else:
+                    st.error("Invalid or expired reset code")
+            if st.button("Cancel password reset"):
+                st.session_state.show_forgot_password = False
+                st.rerun()
     
     with tab2:
         st.markdown("### Create a new account")
@@ -1381,6 +1505,12 @@ def main():
     if st.session_state.auth_mode in ("pin_login", "account_login", "authenticated") and get_engine() is not None and not st.session_state.get('db_initialized', False):
         init_db()
         st.session_state.db_initialized = True
+
+    if st.session_state.auth_mode == "authenticated":
+        current_version = get_user_auth_version(st.session_state.user_id)
+        if current_version is None or current_version != st.session_state.get('auth_version'):
+            clear_authenticated_session()
+            st.rerun()
     
     # Show appropriate screen based on auth state
     if st.session_state.auth_mode is None:
@@ -1409,12 +1539,7 @@ def main():
     with col2:
         if st.session_state.auth_mode == "authenticated":
             if st.button("🚪 Logout", use_container_width=True):
-                # Clear session
-                for key in ['auth_mode', 'user_id', 'expenses', 'custom_categories']:
-                    if key in st.session_state:
-                        del st.session_state[key]
-                st.session_state.selected_for_deletion = set()
-                st.session_state.duplicate_generation = st.session_state.get('duplicate_generation', 0) + 1
+                clear_authenticated_session()
                 st.rerun()
         elif st.session_state.auth_mode == "guest":
             if st.button("🔑 Login", use_container_width=True):

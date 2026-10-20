@@ -11,6 +11,7 @@ from tkinter import messagebox, simpledialog, filedialog, ttk
 categories = {"groceries": 0, "transportation": 0, "entertainment": 0, "utilities": 0}
 custom_categories = {}
 expenses = []
+DATA_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'expenses.json')
 
 # GUI Colors
 BG_COLOR = "#f0f0f0"
@@ -92,14 +93,19 @@ def parse_date_input(date_input):
 
 def le():
     global expenses, custom_categories
-    if os.path.exists('expenses.json'):
-        with open('expenses.json', 'r') as file:
+    source = DATA_FILE
+    # Pick up data from the former working-directory location once, if needed.
+    legacy_file = os.path.abspath('expenses.json')
+    if not os.path.exists(source) and legacy_file != source and os.path.exists(legacy_file):
+        source = legacy_file
+    if os.path.exists(source):
+        with open(source, 'r', encoding='utf-8') as file:
             data = json.load(file)
             expenses = data.get('expenses', [])
             custom_categories = data.get('custom_categories', {})
 
 def se():
-    with open('expenses.json', 'w') as file:
+    with open(DATA_FILE, 'w', encoding='utf-8') as file:
         data = {'expenses': expenses, 'custom_categories': custom_categories}
         json.dump(data, file)
 

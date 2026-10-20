@@ -13,7 +13,7 @@ A comprehensive expense tracking application with both **desktop GUI** and **web
 - **📊 View Summary** - Get insights with category-wise breakdowns and statistics
 - **📅 Filter by Period** - View expenses by daily, weekly, or monthly periods
 - **📁 Custom Categories** - Create and manage your own expense categories
-- **💾 Data Persistence** - Desktop data is saved to JSON when the window closes; authenticated web data is stored in PostgreSQL
+- **💾 Data Persistence** - Desktop data is saved beside its launcher when the window closes; authenticated web data is stored in PostgreSQL
 - **📥 Export to Excel** - Download your expense data as Excel files
 
 ### Smart Date Input
@@ -71,7 +71,7 @@ streamlit run app.py
 3. Click **Connect** → select **SQLAlchemy** → copy the connection string  
    `postgresql://USER:PASSWORD@HOST/neondb?sslmode=require`
 4. For local dev, place this string in `.env` as shown above (the app loads it via `python-dotenv`)
-5. Without `DATABASE_URL`, the web app offers guest mode with session-only data. PIN accounts require PostgreSQL. The desktop app uses `expenses.json`.
+5. Without `DATABASE_URL`, the web app offers guest mode with session-only data. PIN and email/password accounts require PostgreSQL. The desktop app keeps `expenses.json` beside its launcher and can import data from the former working-directory location.
 
 ### Deploy to Streamlit Community Cloud (free)
 
@@ -113,7 +113,7 @@ Create a PIN account with `DATABASE_URL` configured, then save the Account ID sh
 
 ### Email/password accounts on the web
 
-With `DATABASE_URL` configured, Account Mode supports registration and login using an email address and a password of at least eight characters. Passwords are stored as salted hashes. Five failed sign-in attempts lock an account for 15 minutes. Password recovery is not available yet, so keep your password safe.
+With `DATABASE_URL` configured, Account Mode supports registration and login using an email address and a password of at least eight characters. Passwords are stored as salted hashes. Five failed sign-in attempts lock an account for 15 minutes. Password recovery uses a single-use email code that expires after 15 minutes and requires `GMAIL_USER` and `GMAIL_APP_PASSWORD`. Credential resets sign out existing sessions when they next interact with the app.
 
 ### Viewing Summary
 - See total expenses across all categories
@@ -169,7 +169,7 @@ The app intelligently parses various date formats:
 ## 🔮 Future Enhancements
 
 - [ ] Persistent guest storage or SQLite support
-- [ ] Password recovery and email verification for account mode
+- [ ] Email verification for account mode
 - [ ] Budget setting and tracking
 - [ ] Expense reports and analytics
 - [ ] Mobile app version
