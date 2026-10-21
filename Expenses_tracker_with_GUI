@@ -161,12 +161,26 @@ def am():
     messagebox.showinfo("Success", "Expense recorded successfully.", parent=root)
 
 def ete():
-    df = pd.DataFrame(expenses)
-    
     filename = filedialog.asksaveasfilename(defaultextension=".xlsx", filetypes=[("Excel files", "*.xlsx")])
-    if filename:
-        df.to_excel(filename, index=False, engine='openpyxl')
-        messagebox.showinfo("Export", f"Expenses exported to {filename}.")
+    if not filename:
+        return
+    temporary_path = None
+    try:
+        df = pd.DataFrame(expenses)
+        with tempfile.NamedTemporaryFile(
+            dir=os.path.dirname(os.path.abspath(filename)),
+            prefix='.expenses-export-', suffix='.xlsx', delete=False,
+        ) as file:
+            temporary_path = file.name
+        df.to_excel(temporary_path, index=False, engine='openpyxl')
+        os.replace(temporary_path, filename)
+    except (OSError, ImportError, TypeError, ValueError) as error:
+        messagebox.showerror("Export failed", f"Expenses were not exported: {error}", parent=root)
+        return
+    finally:
+        if temporary_path and os.path.exists(temporary_path):
+            os.unlink(temporary_path)
+    messagebox.showinfo("Export", f"Expenses exported to {filename}.", parent=root)
 
 def cc():
     all_categories = {**categories, **custom_categories}
@@ -566,7 +580,8 @@ def show_main_window():
     create_styled_button(content_frame, "📊 View Summary", lambda: vs(), 1, pady=12)
     create_styled_button(content_frame, "📅 View Expenses by Period", lambda: vep(), 2, pady=12)
     create_styled_button(content_frame, "📁 Manage Categories", lambda: manage_categories(), 3, pady=12)
-    create_styled_button(content_frame, "💾 Save and Exit", lambda: on_exit(export=True), 4, pady=12)
+    create_styled_button(content_frame, "📥 Export to Excel", ete, 4, pady=12)
+    create_styled_button(content_frame, "💾 Save and Exit", on_exit, 5, pady=12)
     
     root.mainloop()
 

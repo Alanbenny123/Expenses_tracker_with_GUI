@@ -107,6 +107,11 @@ def init_db():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """))
+        # Releases before account support created this table without an owner.
+        conn.execute(text("""
+            ALTER TABLE expenses ADD COLUMN IF NOT EXISTS user_id
+                INTEGER REFERENCES users(id) ON DELETE CASCADE
+        """))
         
         # Create custom_categories table (now with user_id)
         conn.execute(text("""
@@ -117,6 +122,20 @@ def init_db():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(user_id, name)
             );
+        """))
+        conn.execute(text("""
+            ALTER TABLE custom_categories ADD COLUMN IF NOT EXISTS user_id
+                INTEGER REFERENCES users(id) ON DELETE CASCADE
+        """))
+        # The former name-only constraint prevents different accounts from
+        # choosing the same category. Keep uniqueness within each account.
+        conn.execute(text("""
+            ALTER TABLE custom_categories
+                DROP CONSTRAINT IF EXISTS custom_categories_name_key
+        """))
+        conn.execute(text("""
+            CREATE UNIQUE INDEX IF NOT EXISTS custom_categories_user_id_name_key
+                ON custom_categories(user_id, name)
         """))
 
 

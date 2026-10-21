@@ -19,6 +19,7 @@ FUNCTIONS = {
     "hash_pin", "hash_password", "verify_password", "create_account_user", "authenticate_account",
     "request_password_reset", "reset_account_password",
     "get_user_auth_version", "send_account_ids_by_email", "create_pin_user",
+    "init_db",
 }
 tree = ast.parse(SOURCE.read_text())
 module = ast.Module(body=[node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in FUNCTIONS], type_ignores=[])
@@ -63,7 +64,7 @@ class FakeEngine:
     def begin(self):
         yield self
 
-    def execute(self, sql, params):
+    def execute(self, sql, params=None):
         self.calls.append((" ".join(sql.split()), params))
         return next(self.responses, Result())
 
@@ -223,6 +224,22 @@ class SecurityAndPersistenceTests(unittest.TestCase):
         self.engine = FakeEngine([Result(3)])
         self.assertEqual(scope["get_user_auth_version"](17), 3)
         self.assertEqual(self.engine.calls[0][1]["user_id"], 17)
+
+    def test_legacy_database_tables_gain_account_scoped_columns_and_index(self):
+        scope["init_db"]()
+        statements = [sql for sql, _ in self.engine.calls]
+        expense_table = next(i for i, sql in enumerate(statements) if "CREATE TABLE IF NOT EXISTS expenses" in sql)
+        expense_owner = next(i for i, sql in enumerate(statements) if "ALTER TABLE expenses ADD COLUMN" in sql)
+        category_table = next(i for i, sql in enumerate(statements) if "CREATE TABLE IF NOT EXISTS custom_categories" in sql)
+        category_owner = next(i for i, sql in enumerate(statements) if "ALTER TABLE custom_categories ADD COLUMN" in sql)
+        drop_global_unique = next(i for i, sql in enumerate(statements) if "DROP CONSTRAINT IF EXISTS custom_categories_name_key" in sql)
+        scoped_unique = next(i for i, sql in enumerate(statements) if "CREATE UNIQUE INDEX IF NOT EXISTS custom_categories_user_id_name_key" in sql)
+        self.assertLess(expense_table, expense_owner)
+        self.assertLess(category_table, category_owner)
+        self.assertLess(category_owner, drop_global_unique)
+        self.assertLess(drop_global_unique, scoped_unique)
+        self.assertIn("REFERENCES users(id) ON DELETE CASCADE", statements[expense_owner])
+        self.assertIn("ON custom_categories(user_id, name)", statements[scoped_unique])
 
 
 if __name__ == "__main__":

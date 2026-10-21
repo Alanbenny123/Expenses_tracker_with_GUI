@@ -73,6 +73,8 @@ streamlit run app.py
 4. For local dev, place this string in `.env` as shown above (the app loads it via `python-dotenv`)
 5. Without `DATABASE_URL`, the web app offers guest mode with session-only data. PIN and email/password accounts require PostgreSQL. The desktop app keeps `expenses.json` beside its launcher and can import data from the former working-directory location.
 
+When an older shared PostgreSQL database is reused, startup adds account ownership columns and changes custom category uniqueness to be per account. Existing rows without an owner are retained in the database; an administrator must assign them to the correct account before they appear in that account.
+
 Guest expenses and custom categories remain available in the same browser session after you log out of an account. They are kept separate from account data.
 
 ### Deploy to Streamlit Community Cloud (free)

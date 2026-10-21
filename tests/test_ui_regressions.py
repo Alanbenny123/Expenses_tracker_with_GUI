@@ -200,6 +200,54 @@ class UiRegressionTests(unittest.TestCase):
         self.assertEqual(len(events), 1)
         self.assertIn("disk full", events[0][1])
 
+    def test_desktop_export_failure_preserves_existing_workbook(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            filename = os.path.join(temp_dir, "report.xlsx")
+            Path(filename).write_bytes(b"previous workbook")
+            messages = []
+
+            class ExportFrame:
+                def to_excel(self, path, **kwargs):
+                    Path(path).write_bytes(b"incomplete workbook")
+                    raise OSError("export interrupted")
+
+            desktop = {
+                "pd": SimpleNamespace(DataFrame=lambda rows: ExportFrame()),
+                "expenses": [{"amount": 12}], "tempfile": tempfile, "os": os,
+                "filedialog": SimpleNamespace(asksaveasfilename=lambda **kwargs: filename),
+                "messagebox": SimpleNamespace(
+                    showerror=lambda *args, **kwargs: messages.append(("error", args)),
+                    showinfo=lambda *args, **kwargs: messages.append(("info", args))),
+                "root": object(),
+            }
+            load_functions(ROOT / "Expenses_tracker_with_GUI", {"ete"}, desktop)
+            desktop["ete"]()
+            self.assertEqual(Path(filename).read_bytes(), b"previous workbook")
+            self.assertEqual(os.listdir(temp_dir), ["report.xlsx"])
+            self.assertEqual(messages[0][0], "error")
+
+            class SuccessfulExportFrame:
+                def to_excel(self, path, **kwargs):
+                    Path(path).write_bytes(b"new workbook")
+
+            desktop["pd"] = SimpleNamespace(DataFrame=lambda rows: SuccessfulExportFrame())
+            desktop["ete"]()
+            self.assertEqual(Path(filename).read_bytes(), b"new workbook")
+            self.assertEqual(os.listdir(temp_dir), ["report.xlsx"])
+            self.assertEqual(messages[-1][0], "info")
+
+    def test_desktop_save_and_exit_does_not_request_export(self):
+        tree = ast.parse((ROOT / "Expenses_tracker_with_GUI").read_text())
+        window = next(node for node in tree.body
+                      if isinstance(node, ast.FunctionDef) and node.name == "show_main_window")
+        buttons = {}
+        for node in ast.walk(window):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "create_styled_button":
+                if node.args[1].value in ("💾 Save and Exit", "📥 Export to Excel"):
+                    buttons[node.args[1].value] = node.args[2].id
+        self.assertEqual(buttons["💾 Save and Exit"], "on_exit")
+        self.assertEqual(buttons["📥 Export to Excel"], "ete")
+
     def test_desktop_rejects_nonpositive_and_nonfinite_amounts(self):
         for amount in ("0", "-5", "nan", "inf"):
             with self.subTest(amount=amount):
